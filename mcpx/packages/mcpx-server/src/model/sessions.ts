@@ -125,6 +125,7 @@ export interface McpClientInfo {
 }
 
 export interface McpxSessionMetadata {
+  toolMode?: "catalog" | "lazy";
   consumerTag?: string;
   clientId: string;
   llm?: {
