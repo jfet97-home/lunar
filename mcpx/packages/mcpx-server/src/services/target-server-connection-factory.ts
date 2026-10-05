@@ -33,6 +33,7 @@ import {
   resolveHeadersValues,
 } from "./target-server-env-resolution.js";
 import { BehaviorServiceI, BehaviorSetting } from "./behavior-service.js";
+import { PaginatedClient } from "./paginated-client.js";
 
 /**
  * Factory for creating connections to different types of target MCP servers
@@ -241,7 +242,7 @@ function inheritedProcessEnv(): Record<string, string> {
 }
 
 export function buildClient(targetServiceName: string): Client {
-  return new Client({
+  return new PaginatedClient({
     name: `mcpx::${targetServiceName}`,
     version: "1.0.0",
   });
