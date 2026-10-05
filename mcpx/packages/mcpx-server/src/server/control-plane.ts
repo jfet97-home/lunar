@@ -6,6 +6,7 @@ import {
   createServerFromCatalogRequestSchema,
   initiateServerAuthRequestSchema,
   ListSavedSetupsResponse,
+  LocalExportResponse,
   MessageResponse,
   SaveSetupResponse,
   saveSetupRequestSchema,
@@ -72,6 +73,8 @@ export function buildControlPlaneRouter(
   logger: Logger,
 ): Router {
   const router = Router();
+  const shouldUseHubSavedSetups = (): boolean =>
+    env.IS_ENTERPRISE || services.hubService.status.status === "authenticated";
 
   if (!env.ENABLE_CONTROL_PLANE_REST) {
     logger.debug(
@@ -435,11 +438,21 @@ export function buildControlPlaneRouter(
     }
 
     const { description } = parsed.data;
-    const currentSetup = services.setupManager.getCurrentSetup();
-    const result = await services.hubService.savedSetups.saveSetup({
-      ...currentSetup,
-      description,
-    });
+    const currentSetup = services.setupManager.captureCurrentSetup();
+    let result;
+    try {
+      result = shouldUseHubSavedSetups()
+        ? await services.hubService.savedSetups.saveSetup({
+            ...currentSetup,
+            description,
+          })
+        : await services.localSavedSetups.save(description, currentSetup);
+    } catch (e) {
+      const error = loggableError(e);
+      logger.error("Failed to save setup", { error });
+      res.status(500).json({ message: error.errorMessage });
+      return;
+    }
 
     if (!result.success) {
       logger.error("Failed to save setup", { error: result.error });
@@ -451,15 +464,21 @@ export function buildControlPlaneRouter(
   });
 
   router.get("/saved-setups", authGuard, async (_req, res) => {
-    const result = await services.hubService.savedSetups.listSavedSetups();
-    if (!result.success) {
-      logger.error("Failed to list saved setups", { error: result.error });
-      res.status(500).json({ message: result.error });
-      return;
+    try {
+      const result = shouldUseHubSavedSetups()
+        ? await services.hubService.savedSetups.listSavedSetups()
+        : { success: true as const, ...(await services.localSavedSetups.list()) };
+      if (!result.success) {
+        logger.error("Failed to list saved setups", { error: result.error });
+        res.status(500).json({ message: result.error });
+        return;
+      }
+      res.status(200).json({ setups: result.setups } satisfies ListSavedSetupsResponse);
+    } catch (e) {
+      const error = loggableError(e);
+      logger.error("Failed to list saved setups", { error });
+      res.status(500).json({ message: error.errorMessage });
     }
-    res
-      .status(200)
-      .json({ setups: result.setups } satisfies ListSavedSetupsResponse);
   });
 
   router.delete("/saved-setups/:id", authGuard, async (req, res) => {
@@ -469,8 +488,23 @@ export function buildControlPlaneRouter(
       return;
     }
 
-    const result =
-      await services.hubService.savedSetups.deleteSavedSetup(savedSetupId);
+    let result: { success: boolean; error?: string; errorCode?: string };
+    try {
+      result = shouldUseHubSavedSetups()
+        ? await services.hubService.savedSetups.deleteSavedSetup(savedSetupId)
+        : (await services.localSavedSetups.delete(savedSetupId))
+          ? { success: true }
+          : {
+              success: false,
+              error: "Saved setup not found",
+              errorCode: "not_found",
+            };
+    } catch (e) {
+      const error = loggableError(e);
+      logger.error("Failed to delete saved setup", { savedSetupId, error });
+      res.status(500).json({ message: error.errorMessage });
+      return;
+    }
 
     if (!result.success) {
       const status = result.errorCode === "not_found" ? 404 : 500;
@@ -494,11 +528,30 @@ export function buildControlPlaneRouter(
       return;
     }
 
-    const currentSetup = services.setupManager.getCurrentSetup();
-    const result = await services.hubService.savedSetups.updateSavedSetup({
-      savedSetupId,
-      ...currentSetup,
-    });
+    const currentSetup = services.setupManager.captureCurrentSetup();
+    let result: { success: boolean; error?: string; errorCode?: string };
+    try {
+      result = shouldUseHubSavedSetups()
+        ? await services.hubService.savedSetups.updateSavedSetup({
+            savedSetupId,
+            ...currentSetup,
+          })
+        : (await services.localSavedSetups.overwrite(
+              savedSetupId,
+              currentSetup,
+            ))
+          ? { success: true }
+          : {
+              success: false,
+              error: "Saved setup not found",
+              errorCode: "not_found",
+            };
+    } catch (e) {
+      const error = loggableError(e);
+      logger.error("Failed to update saved setup", { savedSetupId, error });
+      res.status(500).json({ message: error.errorMessage });
+      return;
+    }
 
     if (!result.success) {
       const status = result.errorCode === "not_found" ? 404 : 500;
@@ -522,24 +575,24 @@ export function buildControlPlaneRouter(
       return;
     }
 
-    // Get the saved setup from the list
-    const listResult = await services.hubService.savedSetups.listSavedSetups();
-    if (!listResult.success) {
-      logger.error("Failed to list saved setups for restore", {
-        savedSetupId,
-        error: listResult.error,
-      });
-      res.status(500).json({ message: listResult.error });
-      return;
-    }
-    const savedSetup = listResult.setups.find((s) => s.id === savedSetupId);
-    if (!savedSetup) {
-      res.status(404).json({ message: "Saved setup not found" });
-      return;
-    }
-
-    // Apply the saved setup locally (this triggers setup-changed to Hub)
     try {
+      let savedSetup;
+      if (shouldUseHubSavedSetups()) {
+        const result = await services.hubService.savedSetups.listSavedSetups();
+        if (!result.success) {
+          logger.error("Failed to list saved setups for restore", { savedSetupId, error: result.error });
+          res.status(500).json({ message: result.error });
+          return;
+        }
+        savedSetup = result.setups.find((setup) => setup.id === savedSetupId);
+      } else {
+        savedSetup = await services.localSavedSetups.get(savedSetupId);
+      }
+      if (!savedSetup) {
+        res.status(404).json({ message: "Saved setup not found" });
+        return;
+      }
+
       await services.setupManager.applySetup({
         setupId: savedSetupId,
         targetServers: savedSetup.targetServers,
@@ -555,6 +608,20 @@ export function buildControlPlaneRouter(
         message: "Failed to restore setup",
         error: error.errorMessage,
       });
+    }
+  });
+
+  router.post("/backup/export", authGuard, async (_req, res) => {
+    try {
+      const result = await services.localExportService.create({
+        effectiveAppConfig: services.controlPlane.getAppConfig().yaml,
+        effectiveTargetServers: services.upstreamHandler.servers,
+      });
+      res.status(201).json(result satisfies LocalExportResponse);
+    } catch (e) {
+      const error = loggableError(e);
+      logger.error("Failed to export local backup", { error });
+      res.status(500).json({ message: error.errorMessage });
     }
   });
 
