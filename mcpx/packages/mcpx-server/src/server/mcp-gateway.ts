@@ -315,10 +315,25 @@ export async function getServer(
       const clientName = session?.metadata.clientInfo?.name;
 
       try {
+        const resolved = services.capabilityResolver.resolveToolCall(
+          request.params.name,
+          { consumerTag, clientName },
+        );
+        if (!resolved.ok) {
+          throw makeUnavailableError(
+            "Tool",
+            request.params.name,
+            resolved.reason,
+          );
+        }
+        const authVersion = services.upstreamHandler.getAuthVersion(
+          resolved.entry.serverName,
+        );
         const cached = getCachedToolCallEntry({
           services,
           session,
           request,
+          authVersion,
         });
         switch (cached?.status) {
           case "resolved":
@@ -340,6 +355,7 @@ export async function getServer(
           consumerTag,
           authorization: session?.metadata.authorization,
           logger,
+          authVersion,
         });
       } finally {
         keepaliveStopper();
@@ -725,6 +741,7 @@ function getCachedToolCallEntry(options: {
   services: Services;
   session: McpxSession | undefined;
   request: CallToolRequest;
+  authVersion: number;
 }): ToolCallCacheEntry | undefined {
   const { session, request } = options;
   if (!session || !isToolCallCacheable(options)) {
@@ -734,7 +751,7 @@ function getCachedToolCallEntry(options: {
   const cache = getSessionCache(session);
   pruneExpiredCacheEntries(cache);
 
-  const cacheKey = buildToolCallCacheKey(request);
+  const cacheKey = buildToolCallCacheKey(request, options.authVersion);
   return cache.get(cacheKey);
 }
 
@@ -747,6 +764,7 @@ async function createAndAwaitToolCallEntry(options: {
   consumerTag: string | undefined;
   authorization: string | undefined;
   logger: Logger;
+  authVersion: number;
 }): Promise<ToolCallResultUnion> {
   const {
     services,
@@ -777,7 +795,7 @@ async function createAndAwaitToolCallEntry(options: {
   const cache = getSessionCache(session);
   pruneExpiredCacheEntries(cache);
 
-  const cacheKey = buildToolCallCacheKey(request);
+  const cacheKey = buildToolCallCacheKey(request, options.authVersion);
   const existing = cache.get(cacheKey);
   if (existing) {
     if (existing.status === "resolved") {
@@ -884,11 +902,15 @@ export function enforceCacheLimit(
   }
 }
 
-export function buildToolCallCacheKey(request: CallToolRequest): string {
+export function buildToolCallCacheKey(
+  request: CallToolRequest,
+  authVersion = 0,
+): string {
   const explicitKey = extractCallCorrelationKey(request);
   return [
     `progressToken:${typeof explicitKey}:${String(explicitKey)}`,
     `toolName:${request.params.name}`,
+    `authVersion:${authVersion}`,
     `arguments:${stableStringify(request.params.arguments)}`,
   ].join("|");
 }
