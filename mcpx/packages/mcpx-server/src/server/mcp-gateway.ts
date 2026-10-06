@@ -678,7 +678,9 @@ function listVisibleLazyServers(
       ? client.extendedClient.serverInfo
       : undefined;
     const description =
-      serverInfo?.description?.trim() || catalogEntry?.description?.trim();
+      client.targetServer.description?.trim() ||
+      serverInfo?.description?.trim() ||
+      catalogEntry?.description?.trim();
     return [{ name, ...(description ? { description } : {}) }];
   });
 }

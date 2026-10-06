@@ -92,6 +92,7 @@ export const createTargetServerStdioRequestSchema = z
     command: AllowedCommands,
     env: z.record(z.string(), envValueSchema).optional().default({}),
     icon: z.string().optional(),
+    description: z.string().optional(),
     name: z.string(),
     catalogItemId: z.string().optional(),
   })
@@ -102,6 +103,7 @@ export const createTargetServerSSESchema = z.object({
   url: z.string(),
   headers: z.record(z.string(), envValueSchema).optional(),
   icon: z.string().optional(),
+  description: z.string().optional(),
   name: z.string(),
   catalogItemId: z.string().optional(),
 });
@@ -111,6 +113,7 @@ export const createTargetServerStreamableHttpSchema = z.object({
   url: z.string(),
   headers: z.record(z.string(), envValueSchema).optional(),
   icon: z.string().optional(),
+  description: z.string().optional(),
   name: z.string(),
   catalogItemId: z.string().optional(),
 });
