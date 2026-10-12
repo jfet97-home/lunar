@@ -36,6 +36,10 @@ flowchart LR
 
 ## Connect a client
 
+The [MCPX usage skill](skills/use-lunar-mcpx/SKILL.md) packages discovery, tool-call
+and sign-in workflows for installation in an agent's skills directory. Its bundled
+references support usage without a checkout of this repository.
+
 Once MCPX is running, point your client at one of these endpoints:
 
 | Endpoint | How the client sees tools |
