@@ -13,10 +13,7 @@ import os from "node:os";
 import path from "node:path";
 import { stringify } from "yaml";
 import { DEFAULT_CONFIG } from "../config.js";
-import type {
-  ListSavedSetupsResponse,
-  SaveSetupResponse,
-} from "@mcpx/shared-model";
+import type { SaveSetupResponse } from "@mcpx/shared-model";
 import { savedSetupItemSchema } from "@mcpx/shared-model";
 import { noOpLogger } from "@aigw/core/logging";
 import { resetEnv } from "../env.js";
@@ -25,6 +22,7 @@ import { LocalImportService } from "../services/local-import-service.js";
 import { LocalSavedSetups } from "../services/local-saved-setups.js";
 import { Services } from "../services/services.js";
 import { CurrentSetup } from "../services/setup-manager.js";
+import type { SavedSetupsClient } from "../services/saved-setups-client.js";
 import { buildControlPlaneRouter } from "./control-plane.js";
 import { noOpAuthGuard } from "./auth.js";
 
@@ -38,7 +36,9 @@ describe("control plane local saved setups and exports", () => {
   let localSavedSetups: LocalSavedSetups;
   let hubSavedSetups: {
     saveSetup: jest.Mock<() => Promise<SaveSetupResponse>>;
-    listSavedSetups: jest.Mock<() => Promise<ListSavedSetupsResponse>>;
+    listSavedSetups: jest.Mock<
+      () => Promise<Awaited<ReturnType<SavedSetupsClient["listSavedSetups"]>>>
+    >;
     deleteSavedSetup: jest.Mock<
       () => Promise<{ success: boolean; error?: string; errorCode?: string }>
     >;
@@ -62,8 +62,12 @@ describe("control plane local saved setups and exports", () => {
     hubSavedSetups = {
       saveSetup: jest.fn<() => Promise<SaveSetupResponse>>(),
       listSavedSetups: jest
-        .fn<() => Promise<ListSavedSetupsResponse>>()
-        .mockResolvedValue({ setups: [] }),
+        .fn<
+          () => Promise<
+            Awaited<ReturnType<SavedSetupsClient["listSavedSetups"]>>
+          >
+        >()
+        .mockResolvedValue({ success: true, setups: [] }),
       deleteSavedSetup: jest.fn<
         () => Promise<{
           success: boolean;
@@ -255,6 +259,7 @@ describe("control plane local saved setups and exports", () => {
       savedAt,
     });
     hubSavedSetups.listSavedSetups.mockResolvedValue({
+      success: true,
       setups: [
         savedSetupItemSchema.parse({
           id: savedSetupId,
@@ -323,6 +328,32 @@ describe("control plane local saved setups and exports", () => {
     expect(localGet).not.toHaveBeenCalled();
     expect(localOverwrite).not.toHaveBeenCalled();
     expect(localDelete).not.toHaveBeenCalled();
+  });
+
+  it("preserves Hub list failures for listing and restoring without falling back locally", async () => {
+    process.env["INSTANCE_KEY"] = "enterprise-instance-key";
+    resetEnv();
+    hubSavedSetups.listSavedSetups.mockResolvedValue({
+      success: false,
+      error: "Hub connection is unavailable",
+    });
+    const localList = jest.spyOn(localSavedSetups, "list");
+    const localGet = jest.spyOn(localSavedSetups, "get");
+    for (const [suffix, method] of [
+      ["", "GET"],
+      ["/0190a000-0000-7000-8000-000000000020/restore", "POST"],
+    ]) {
+      const response = await fetch(`${baseUrl}/saved-setups${suffix}`, {
+        method,
+      });
+      expect(response.status).toBe(500);
+      await expect(response.json()).resolves.toEqual({
+        message: "Hub connection is unavailable",
+      });
+    }
+    expect(localList).not.toHaveBeenCalled();
+    expect(localGet).not.toHaveBeenCalled();
+    expect(appliedSetup).toBeUndefined();
   });
 
   it("writes a full export locally and reports the configured destination", async () => {

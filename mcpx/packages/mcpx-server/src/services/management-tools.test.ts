@@ -60,6 +60,7 @@ function fixture() {
       }),
       logoutOAuthForServer: jest.fn().mockResolvedValue(undefined),
       reconnectServer: jest.fn().mockResolvedValue(true),
+      refreshServerTools: jest.fn().mockResolvedValue(undefined),
     },
     setupManager: { captureCurrentSetup: jest.fn(() => setup) },
     localSavedSetups: { save: jest.fn().mockResolvedValue(saveResult) },
@@ -127,9 +128,9 @@ function json(response: CallToolResult) {
 }
 
 describe("built-in management tools", () => {
-  it("advertises ten schemas and destructive annotations", () => {
+  it("advertises eleven schemas and destructive annotations", () => {
     const { tools } = fixture();
-    expect(tools).toHaveLength(10);
+    expect(tools).toHaveLength(11);
     for (const { definition } of tools)
       expect(definition.inputSchema.type).toBe("object");
     expect(
@@ -241,6 +242,26 @@ describe("built-in management tools", () => {
     expect(
       services.controlPlane.config.deactivateTargetServer,
     ).not.toHaveBeenCalled();
+  });
+
+  it("refreshes a connected catalog without replacing configuration or logging out", async () => {
+    const { call, services } = fixture();
+    expect(
+      json(await call("management_refresh_server", { name: "DOCS" })),
+    ).toEqual({ name: "docs", refreshed: true });
+    expect(services.upstreamHandler.refreshServerTools).toHaveBeenCalledWith(
+      "docs",
+    );
+    expect(services.controlPlane.removeTargetServer).not.toHaveBeenCalled();
+    expect(
+      services.upstreamHandler.logoutOAuthForServer,
+    ).not.toHaveBeenCalled();
+    services.upstreamHandler.refreshServerTools.mockRejectedValue(
+      new Error("failed"),
+    );
+    expect(
+      (await call("management_refresh_server", { name: "docs" })).isError,
+    ).toBe(true);
   });
 
   it("reconnects a failed server without replacing configuration or logging out", async () => {
@@ -412,7 +433,7 @@ describe("built-in management tools", () => {
       new InternalCapabilitiesService(noOpLogger),
       registry,
     );
-    expect(registry.servers.get("mcpx")?.tools).toHaveLength(11);
+    expect(registry.servers.get("mcpx")?.tools).toHaveLength(12);
     expect(registry.servers.get("mcpx")?.tools?.[0]?.definition.name).toBe(
       "get_new_capabilities",
     );

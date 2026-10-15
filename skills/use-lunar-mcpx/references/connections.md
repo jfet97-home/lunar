@@ -8,6 +8,7 @@ names; the client may add a namespace prefix. Inspect their supplied schemas fir
 | `mcpx__management_list_servers` | Read configured names, transports, enabled state, connection state and whether OAuth is active. |
 | `mcpx__management_login_server` | Start a provider sign-in for one configured server. |
 | `mcpx__management_reconnect_server` | Retry one failed connection while preserving its configuration and credentials. |
+| `mcpx__management_refresh_server` | Fetch current tool schemas from one connected server without replacing its connection or credentials. |
 | `mcpx__management_enable_server` | Make an intentionally disabled integration available when requested. |
 | `mcpx__management_disable_server` | Disable an integration while retaining its configuration and authentication when requested. |
 
@@ -36,6 +37,12 @@ available private secret-entry mechanism or report that setup is required.
 For a failed configured server, an authorized reconnect is narrower than replacing
 configuration, logging out or restarting the gateway. Reconnect does nothing for
 connected, connecting or pending-auth servers and never retries a failed tool call.
+
+For stale upstream schemas, call `mcpx__management_refresh_server` for the affected
+connected server. It updates the gateway catalog and notifies downstream clients
+when definitions change. Replacing a server configuration with the same values also
+refreshes its tools. Neither action needs removal, logout or a gateway restart.
+Description-only edits from the UI keep their existing lightweight behavior.
 
 An absent discovery result can reflect permissions, a disabled integration, failed
 connectivity, pending authentication or stale client definitions. Use the available

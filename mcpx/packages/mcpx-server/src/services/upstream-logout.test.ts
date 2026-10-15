@@ -1,7 +1,11 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
+import {
+  CallToolResultSchema,
+  ErrorCode,
+  McpError,
+} from "@modelcontextprotocol/sdk/types.js";
 import { noOpLogger } from "@aigw/core/logging";
 import { ManualClock } from "@aigw/core/time";
 import { ConfigService, DEFAULT_CONFIG } from "../config.js";
@@ -52,6 +56,7 @@ describe("upstream recovery and OAuth logout", () => {
   async function makeHarness(
     serverName = "docs",
     overrides: Partial<UpstreamHandlerConfig> = {},
+    initialize = false,
   ) {
     const targetServer: RemoteTargetServer = {
       name: serverName,
@@ -162,7 +167,8 @@ describe("upstream recovery and OAuth logout", () => {
         ...overrides,
       },
     );
-    await upstream.addClient(targetServer);
+    if (initialize) await upstream.initialize();
+    else await upstream.addClient(targetServer);
     return {
       targetServer,
       upstream,
@@ -183,8 +189,10 @@ describe("upstream recovery and OAuth logout", () => {
     };
   }
 
-  async function callManagementRemove(
+  async function callManagementAction(
     harness: Awaited<ReturnType<typeof makeHarness>>,
+    action = "management_remove_server",
+    args: Record<string, unknown> = { name: "docs" },
   ) {
     const controlPlane = new ControlPlaneService(
       harness.state,
@@ -212,18 +220,17 @@ describe("upstream recovery and OAuth logout", () => {
     wireInternalCapabilityProvider(provider, internal, harness.registry);
     const entry = {
       serverName: "mcpx",
-      capabilityName: "management_remove_server",
+      capabilityName: action,
       origin: "internal" as const,
       definition: {
         ...harness.registry.servers
           .get("mcpx")!
-          .tools!.find(
-            ({ definition }) => definition.name === "management_remove_server",
-          )!.definition,
-        name: "mcpx__management_remove_server",
+          .tools!.find(({ definition }) => definition.name === action)!
+          .definition,
+        name: `mcpx__${action}`,
       },
     };
-    return internal.dispatchTool(entry, { name: "docs" }, {});
+    return internal.dispatchTool(entry, args, {});
   }
 
   function getToolResponseJson(response: {
@@ -233,6 +240,134 @@ describe("upstream recovery and OAuth logout", () => {
     if (!text) throw new Error("Expected a text tool result");
     return JSON.parse(text) as Record<string, unknown>;
   }
+
+  it.each(["management_update_server", "management_refresh_server"])(
+    "%s replaces same-name schemas without replacing connections or credentials",
+    async (action) => {
+      const harness = await makeHarness("docs", {}, true);
+      const other = {
+        ...harness.extended,
+        close: jest.fn(async () => {}),
+        listTools: jest.fn(async () => ({ tools: [], toolParentNames: {} })),
+      };
+      try {
+        harness.createConnection.mockResolvedValueOnce(other);
+        await harness.upstream.addClient({
+          ...harness.targetServer,
+          name: "other",
+        });
+        const otherCalls = other.listTools.mock.calls.length;
+        const otherCapabilities = harness.registry.servers.get("other");
+        const tokens = await harness.provider.tokens();
+        const onChanged = jest.fn();
+        harness.resolver.onChanged(onChanged);
+        harness.writeConfig.mockClear();
+        const updatedTool = {
+          name: "read",
+          description: "Updated documentation reader",
+          inputSchema: {
+            type: "object" as const,
+            properties: { revision: { type: "string" } },
+            required: ["revision"],
+          },
+          outputSchema: {
+            type: "object" as const,
+            properties: { current: { type: "boolean" } },
+          },
+          annotations: { readOnlyHint: true },
+        };
+        harness.extended.listTools.mockResolvedValue({
+          tools: [updatedTool],
+          toolParentNames: {},
+        });
+        const { name, ...config } = harness.targetServer;
+        const response = await callManagementAction(
+          harness,
+          action,
+          action === "management_update_server" ? { name, config } : { name },
+        );
+
+        expect(response.isError).not.toBe(true);
+        expect(
+          harness.resolver.resolveToolCall("docs__read", {}),
+        ).toMatchObject({
+          ok: true,
+          entry: { definition: { ...updatedTool, name: "docs__read" } },
+        });
+        expect(onChanged).toHaveBeenCalledWith("tools");
+        expect(harness.registry.servers.get("other")).toBe(otherCapabilities);
+        expect(other.listTools).toHaveBeenCalledTimes(otherCalls);
+        expect(harness.createConnection).toHaveBeenCalledTimes(2);
+        expect(harness.extended.close).not.toHaveBeenCalled();
+        expect(other.close).not.toHaveBeenCalled();
+        expect(harness.extended.callTool).not.toHaveBeenCalled();
+        expect(await harness.provider.tokens()).toEqual(tokens);
+        expect(harness.upstream.servers).toEqual([
+          harness.targetServer,
+          { ...harness.targetServer, name: "other" },
+        ]);
+        if (action === "management_refresh_server") {
+          expect(
+            getToolResponseJson(CallToolResultSchema.parse(response)),
+          ).toEqual({
+            name: "docs",
+            refreshed: true,
+          });
+          expect(harness.writeConfig).not.toHaveBeenCalled();
+        }
+      } finally {
+        await harness.upstream.shutdown();
+      }
+    },
+  );
+
+  it("reports a discovery failure without losing the last known tools or credentials", async () => {
+    const harness = await makeHarness("docs", {}, true);
+    try {
+      const tokens = await harness.provider.tokens();
+      harness.extended.listTools.mockRejectedValue(
+        new Error("discovery failed"),
+      );
+      const response = await callManagementAction(
+        harness,
+        "management_refresh_server",
+      );
+      expect(response.isError).toBe(true);
+      expect(harness.resolver.resolveToolCall("docs__read", {}).ok).toBe(true);
+      expect(harness.extended.close).not.toHaveBeenCalled();
+      expect(await harness.provider.tokens()).toEqual(tokens);
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
+
+  it("does not report a stale in-flight refresh as successful after logout", async () => {
+    const harness = await makeHarness("docs", {}, true);
+    try {
+      let finish!: (value: {
+        tools: [];
+        toolParentNames: Record<string, string>;
+      }) => void;
+      harness.extended.listTools.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const refresh = harness.upstream.refreshServerTools("docs");
+      const rejected = expect(refresh).rejects.toThrow();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      await harness.upstream.logoutOAuthForServer("docs");
+      finish({ tools: [], toolParentNames: {} });
+      await rejected;
+      expect(harness.state.export().targetServers[0]?.state.type).toBe(
+        "pending-auth",
+      );
+      expect(harness.resolver.resolveToolCall("docs__read", {}).ok).toBe(false);
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
 
   it("recovers within five minutes after a long outage without rewriting credentials", async () => {
     jest.useFakeTimers();
@@ -680,7 +815,7 @@ describe("upstream recovery and OAuth logout", () => {
             .mockRejectedValue(new Error("Unable to delete credentials"));
         }
 
-        const response = await callManagementRemove(harness);
+        const response = await callManagementAction(harness);
         expect(response.isError).toBe(true);
         expect(getToolResponseJson(response as never)).not.toHaveProperty(
           "removed",
@@ -705,7 +840,7 @@ describe("upstream recovery and OAuth logout", () => {
         "deleteOAuthTokensForServer",
       );
       try {
-        const response = await callManagementRemove(harness);
+        const response = await callManagementAction(harness);
         expect(response.isError).toBeUndefined();
         expect(getToolResponseJson(response as never)).toEqual({
           name: "docs",

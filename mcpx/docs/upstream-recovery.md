@@ -33,6 +33,23 @@ connecting and pending-auth servers are left alone; pending-auth requires login.
 The action never replaces configuration, deletes credentials or replays calls.
 Enabling a server controls tool availability and does not force reconnection.
 
+## Refresh stale tool schemas
+
+Call `mcpx__management_refresh_server` with `{ "name": "your-server" }` to fetch
+the current tool definitions from a connected server, including same-name input
+and output schema, description and annotation changes. It uses the existing
+connection, preserves configuration and credentials, leaves unrelated upstreams
+alone, and never executes a tool. Discovery failures return an error and retain
+the last known catalog; a connection replaced during discovery cannot publish
+stale results. A pending-auth server still needs login.
+
+An explicit same-configuration server update also refreshes tool definitions.
+Description-only UI edits still avoid discovery. Disable/enable changes visibility
+only; reconnect retries only failed connections. Upstream list-change notifications
+continue to refresh automatically when received. A successful refresh updates both
+the full and lazy catalogs and sends list-change notifications when definitions
+change. A downstream client may still require its supported discovery refresh.
+
 ## Notification streams and configuration reload
 
 Both normal and OAuth Streamable HTTP connections use a bounded notification

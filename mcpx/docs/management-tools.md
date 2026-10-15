@@ -5,17 +5,19 @@ management tools are advertised directly with the four discovery tools. Call
 them by their qualified names without searching first, for example
 `mcpx__management_add_server`.
 
-| Tool                        | Purpose                                                                             |
-| --------------------------- | ----------------------------------------------------------------------------------- |
-| `management_list_servers`   | List configured servers with enabled, connection, and OAuth status.                 |
-| `management_add_server`     | Add an MCP server using its stdio, SSE, or Streamable HTTP configuration.           |
-| `management_update_server`  | Replace a server's connection configuration.                                        |
-| `management_enable_server`  | Make an existing server's tools available.                                          |
-| `management_disable_server` | Block an existing server's tools while preserving configuration and authentication. |
-| `management_remove_server`  | Remove a server configuration and its saved OAuth authentication.                   |
-| `management_create_backup`  | Save a setup snapshot or create a full local backup.                                |
-| `management_login_server`   | Start OAuth login and return a browser URL and optional device code.                |
-| `management_logout_server`  | Clear MCPX's saved OAuth authentication while retaining the server configuration.   |
+| Tool                          | Purpose                                                                                          |
+| ----------------------------- | ------------------------------------------------------------------------------------------------ |
+| `management_list_servers`     | List configured servers with enabled, connection, and OAuth status.                              |
+| `management_add_server`       | Add an MCP server using its stdio, SSE, or Streamable HTTP configuration.                        |
+| `management_update_server`    | Replace a server's connection configuration.                                                     |
+| `management_enable_server`    | Make an existing server's tools available.                                                       |
+| `management_disable_server`   | Block an existing server's tools while preserving configuration and authentication.              |
+| `management_refresh_server`   | Refresh one connected server's tool definitions without replacing its connection or credentials. |
+| `management_reconnect_server` | Retry one failed connection immediately while preserving configuration and credentials.          |
+| `management_remove_server`    | Remove a server configuration and its saved OAuth authentication.                                |
+| `management_create_backup`    | Save a setup snapshot or create a full local backup.                                             |
+| `management_login_server`     | Start OAuth login and return a browser URL and optional device code.                             |
+| `management_logout_server`    | Clear MCPX's saved OAuth authentication while retaining the server configuration.                |
 
 ## Access and credentials
 
@@ -34,6 +36,9 @@ tool results and error messages do not echo submitted or stored credentials.
 Treat configuration arguments as sensitive input in the calling client.
 Update replaces the saved connection configuration; omitted remote headers are
 cleared, so credentials from an old URL are not carried to its replacement.
+An update with unchanged connection settings also refreshes the tool catalog.
+Use `management_refresh_server` with `name` when only schemas need refreshing;
+failed discovery is reported as an error, and unrelated connections are untouched.
 
 OAuth login only starts the existing MCPX flow. The user must complete the
 provider's browser or device-code consent step. MCPX does not return tokens or

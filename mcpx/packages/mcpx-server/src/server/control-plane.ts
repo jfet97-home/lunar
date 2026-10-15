@@ -470,13 +470,18 @@ export function buildControlPlaneRouter(
     try {
       const result = shouldUseHubSavedSetups()
         ? await services.hubService.savedSetups.listSavedSetups()
-        : { success: true as const, ...(await services.localSavedSetups.list()) };
+        : {
+            success: true as const,
+            ...(await services.localSavedSetups.list()),
+          };
       if (!result.success) {
         logger.error("Failed to list saved setups", { error: result.error });
         res.status(500).json({ message: result.error });
         return;
       }
-      res.status(200).json({ setups: result.setups } satisfies ListSavedSetupsResponse);
+      res
+        .status(200)
+        .json({ setups: result.setups } satisfies ListSavedSetupsResponse);
     } catch (e) {
       const error = loggableError(e);
       logger.error("Failed to list saved setups", { error });
@@ -583,7 +588,10 @@ export function buildControlPlaneRouter(
       if (shouldUseHubSavedSetups()) {
         const result = await services.hubService.savedSetups.listSavedSetups();
         if (!result.success) {
-          logger.error("Failed to list saved setups for restore", { savedSetupId, error: result.error });
+          logger.error("Failed to list saved setups for restore", {
+            savedSetupId,
+            error: result.error,
+          });
           res.status(500).json({ message: result.error });
           return;
         }

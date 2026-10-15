@@ -235,6 +235,12 @@ export class ControlPlaneService {
           payload.name,
           payload.description ?? existingTargetServer.description,
         );
+        if (
+          options.replaceConfiguration ||
+          updatedTargetServer.description === existingTargetServer.description
+        ) {
+          await this.upstreamHandler.refreshServerTools(payload.name);
+        }
         return this.upstreamHandler.getTargetServer(payload.name);
       }
       // TODO: replace with safe-swap technique:

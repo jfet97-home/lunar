@@ -95,13 +95,14 @@ See the [tool discovery guide](mcpx/docs/lazy-tools.md) for search pagination, l
 
 ## Manage MCP servers from an MCP client
 
-MCPX registers nine built-in management tools on `/mcp` by default. On
+MCPX registers eleven built-in management tools on `/mcp` by default. On
 `/mcp/lazy`, permitted management tools are advertised directly alongside the
 four discovery tools. Their qualified names use the `mcpx__` prefix, such as
 `mcpx__management_list_servers`; call them directly without searching first.
 
 The tools list servers; add, update, enable, disable, and remove server
-configurations; create backups; and start OAuth login or clear saved OAuth
+configurations; refresh tool schemas or retry failed connections; create backups;
+and start OAuth login or clear saved OAuth
 authentication. Existing MCPX authentication applies, and each tool uses its
 configured `mcpx` tool permission for discovery and execution. These
 administrative actions can manage any configured upstream server. Enabling or

@@ -219,6 +219,19 @@ export class ManagementToolsService implements InternalCapabilityProvider {
       activation(true),
       activation(false),
       {
+        name: "management_refresh_server",
+        description:
+          "Refresh tool schemas and metadata from one connected MCP server using its existing connection and credentials. Preserves configuration, permissions, and unrelated connections. Does not execute or retry tool calls. Fails if discovery cannot complete.",
+        schema: namedSchema,
+        idempotent: true,
+        execute: async (args): Promise<unknown> => {
+          const { name } = namedSchema.parse(args);
+          this.requireServer(name);
+          await services.upstreamHandler.refreshServerTools(name);
+          return { name, refreshed: true };
+        },
+      },
+      {
         name: "management_reconnect_server",
         description:
           "Retry one failed MCP connection immediately while preserving its configuration and credentials. Does nothing for connected, connecting, or pending-auth servers. Does not retry tool calls.",

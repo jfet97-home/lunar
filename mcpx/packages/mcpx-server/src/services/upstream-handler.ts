@@ -660,6 +660,18 @@ export class UpstreamHandler
     this.notifyPostChangeHooks();
   }
 
+  /** Refresh one connected server's tool catalog without replacing its connection or credentials. */
+  async refreshServerTools(name: string): Promise<void> {
+    const client = this.requireConnectedClient(name);
+    const refreshed = await this.refreshClientCapability(
+      "tools",
+      name,
+      client,
+      fetchToolCapabilities,
+    );
+    if (!refreshed) throw new FailedToConnectToTargetServer();
+  }
+
   async removeClient(
     name: string,
     options: { strict?: boolean } = {},

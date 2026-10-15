@@ -60,16 +60,19 @@ describe("lazy tool discovery", () => {
     ).toBe(false);
   });
 
-  it("allows the internal credential-preserving reconnect action directly", () => {
-    expect(
-      isLazyManagementCapability({
-        serverName: "mcpx",
-        capabilityName: "management_reconnect_server",
-        origin: "internal",
-        definition: { name: "mcpx__management_reconnect_server" },
-      }),
-    ).toBe(true);
-  });
+  it.each(["reconnect", "refresh"])(
+    "allows the internal credential-preserving %s action directly",
+    (action) => {
+      expect(
+        isLazyManagementCapability({
+          serverName: "mcpx",
+          capabilityName: `management_${action}_server`,
+          origin: "internal",
+          definition: { name: `mcpx__management_${action}_server` },
+        }),
+      ).toBe(true);
+    },
+  );
 
   it("lists server names with bounded existing descriptions and no extra metadata", async () => {
     const result = await resolveLazyToolRequest(
