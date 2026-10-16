@@ -14,6 +14,7 @@ import {
 import { noOpLogger } from "@aigw/core/logging";
 import { ZodError } from "zod/v4";
 import { ConfigService } from "../config.js";
+import { UpstreamSessionExpiredError } from "./streamable-http-reconnection.js";
 
 import {
   ExtensionDescription,
@@ -136,6 +137,34 @@ describe("extractToolParameters", () => {
 });
 
 describe("ExtendedClient", () => {
+  it("forwards session expiry and removes listeners when unsubscribed or closed", async () => {
+    const client = mockOriginalClient();
+    const previousOnError = jest.fn();
+    client.onerror = previousOnError;
+    const configService = {
+      getConfig: () => ({ toolExtensions: { services: {} } }),
+      subscribe: () => () => {},
+    } as unknown as ConfigService;
+    const extended = await new ExtendedClientBuilder(
+      configService,
+      noOpLogger,
+    ).build({ name: "docs", originalClient: client });
+    const listener = jest.fn();
+    const unsubscribe = extended.onSessionExpired!(listener);
+    client.onerror?.(new Error("ordinary failure"));
+    expect(listener).not.toHaveBeenCalled();
+    const expired = new UpstreamSessionExpiredError();
+    client.onerror?.(expired);
+    expect(listener).toHaveBeenCalledWith(expired);
+    expect(previousOnError).toHaveBeenCalledTimes(2);
+    unsubscribe();
+    client.onerror?.(expired);
+    expect(listener).toHaveBeenCalledTimes(1);
+    extended.onSessionExpired!(listener);
+    await extended.close();
+    expect(client.onerror).toBe(previousOnError);
+  });
+
   it("preserves existing upstream handshake metadata through the built client", async () => {
     const client = mockOriginalClient();
     const serverInfo = {
@@ -458,6 +487,23 @@ describe("ExtendedClient", () => {
   });
 });
 describe("ExtendedClient.isAlive", () => {
+  it("can force a session probe after ordinary pings were disabled", async () => {
+    const ping = jest.fn(async () => {
+      throw new McpError(ErrorCode.MethodNotFound, "unsupported");
+    });
+    const extended = new ExtendedClient(
+      "docs",
+      mockOriginalClientWithPing(ping),
+      () => ({}),
+      noOpLogger,
+    );
+    expect(await extended.isAlive(100)).toBeNull();
+    expect(await extended.isAlive(100)).toBe("no-signal");
+    expect(ping).toHaveBeenCalledTimes(1);
+    expect(await extended.isAlive(100, true)).toBeNull();
+    expect(ping).toHaveBeenCalledTimes(2);
+  });
+
   it("returns null when ping succeeds", async () => {
     const client = mockOriginalClientWithPing(async () => ({}));
     const extendedClient = new ExtendedClient(

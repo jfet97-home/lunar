@@ -29,6 +29,7 @@ import {
   wireInternalCapabilityProvider,
 } from "./internal-capabilities-service.js";
 import { ManagementToolsService } from "./management-tools.js";
+import { UpstreamSessionExpiredError } from "./streamable-http-reconnection.js";
 
 describe("upstream recovery and OAuth logout", () => {
   let directory: string;
@@ -110,11 +111,18 @@ describe("upstream recovery and OAuth logout", () => {
       client_id: "old-client",
       redirect_uris: [],
     });
+    const sessionExpiredListeners = new Set<
+      (error: UpstreamSessionExpiredError) => void
+    >();
     const extended = {
       close: jest.fn(async () => {}),
       isAlive: jest.fn(async (): Promise<PingOutcome> => null),
       onToolsListChanged: () => () => {},
       onPromptsListChanged: () => () => {},
+      onSessionExpired(callback: (error: UpstreamSessionExpiredError) => void) {
+        sessionExpiredListeners.add(callback);
+        return () => sessionExpiredListeners.delete(callback);
+      },
       listTools: jest.fn(async () => ({
         tools: [
           { name: "read", inputSchema: { type: "object", properties: {} } },
@@ -186,6 +194,7 @@ describe("upstream recovery and OAuth logout", () => {
       state,
       config,
       oauth,
+      sessionExpiredListeners,
     };
   }
 
@@ -240,6 +249,376 @@ describe("upstream recovery and OAuth logout", () => {
     if (!text) throw new Error("Expected a text tool result");
     return JSON.parse(text) as Record<string, unknown>;
   }
+
+  it("recovers the first expired session immediately without replaying a tool or touching another server", async () => {
+    const harness = await makeHarness("Docs");
+    const other = { ...harness.extended, close: jest.fn(async () => {}) };
+    try {
+      harness.createConnection.mockResolvedValueOnce(other);
+      await harness.upstream.addClient({
+        ...harness.targetServer,
+        name: "other",
+      });
+      const otherCapabilities = harness.registry.servers.get("other");
+      const tokens = await harness.provider.tokens();
+      harness.writeConfig.mockClear();
+      harness.extended.callTool.mockRejectedValueOnce(
+        new UpstreamSessionExpiredError(),
+      );
+      await expect(
+        harness.upstream.callTool("docs", { name: "read" }),
+      ).rejects.toBeInstanceOf(UpstreamSessionExpiredError);
+      expect(harness.createConnection).toHaveBeenCalledTimes(3);
+      expect(harness.createConnection).toHaveBeenLastCalledWith(
+        harness.targetServer,
+        undefined,
+        undefined,
+      );
+      expect(harness.extended.callTool).toHaveBeenCalledTimes(1);
+      expect(
+        harness.state
+          .export()
+          .targetServers.find((server) => server.name === "Docs")?.state.type,
+      ).toBe("connected");
+      expect(harness.registry.servers.get("other")).toBe(otherCapabilities);
+      expect(other.close).not.toHaveBeenCalled();
+      expect(await harness.provider.tokens()).toEqual(tokens);
+      expect(harness.writeConfig).not.toHaveBeenCalled();
+      await expect(
+        harness.upstream.callTool("docs", { name: "read" }),
+      ).resolves.toEqual({ content: [] });
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
+
+  it("shares recovery for concurrent expired calls and ignores a late failure from the old session", async () => {
+    const harness = await makeHarness();
+    let release!: (client: typeof harness.extended) => void;
+    let lateFailure!: (error: Error) => void;
+    const started = new Promise<void>((resolve) => {
+      harness.createConnection.mockImplementationOnce(
+        () =>
+          new Promise((finish) => {
+            release = finish;
+            resolve();
+          }),
+      );
+    });
+    harness.extended.callTool.mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          lateFailure = reject;
+        }),
+    );
+    harness.extended.callTool.mockRejectedValueOnce(
+      new UpstreamSessionExpiredError(),
+    );
+    harness.extended.callTool.mockRejectedValueOnce(
+      new UpstreamSessionExpiredError(),
+    );
+    const lateCall = harness.upstream.callTool("docs", { name: "read" });
+    const expiredCalls = Promise.allSettled([
+      harness.upstream.callTool("docs", { name: "read" }),
+      harness.upstream.callTool("docs", { name: "read" }),
+    ]);
+    const calls = Promise.allSettled([lateCall, expiredCalls]);
+    try {
+      await started;
+      expect(harness.createConnection).toHaveBeenCalledTimes(2);
+      release(harness.extended);
+      const failures = await expiredCalls;
+      expect(failures.every((result) => result.status === "rejected")).toBe(
+        true,
+      );
+      lateFailure(new UpstreamSessionExpiredError());
+      const results = await calls;
+      expect(results[0]?.status).toBe("rejected");
+      expect(harness.createConnection).toHaveBeenCalledTimes(2);
+      expect(harness.extended.close).toHaveBeenCalledTimes(1);
+      expect(harness.extended.callTool).toHaveBeenCalledTimes(3);
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
+
+  it("waits for session recovery when synchronous SDK closure masks the original expiry", async () => {
+    const harness = await makeHarness();
+    let release!: (client: typeof harness.extended) => void;
+    const started = new Promise<void>((resolve) => {
+      harness.createConnection.mockImplementationOnce(
+        () =>
+          new Promise((finish) => {
+            release = finish;
+            resolve();
+          }),
+      );
+    });
+    const closed = new McpError(
+      ErrorCode.ConnectionClosed,
+      "Connection closed",
+    );
+    harness.extended.callTool.mockImplementationOnce(async () => {
+      for (const listener of [...harness.sessionExpiredListeners])
+        listener(new UpstreamSessionExpiredError());
+      throw closed;
+    });
+    let settled = false;
+    const failedCall = harness.upstream
+      .callTool("docs", { name: "read" })
+      .catch((error: unknown) => {
+        settled = true;
+        return error;
+      });
+    try {
+      await started;
+      expect(settled).toBe(false);
+      release(harness.extended);
+      expect(await failedCall).toBe(closed);
+      expect(harness.state.export().targetServers[0]?.state.type).toBe(
+        "connected",
+      );
+      expect(harness.extended.callTool).toHaveBeenCalledTimes(1);
+      await expect(
+        harness.upstream.callTool("docs", { name: "read" }),
+      ).resolves.toEqual({ content: [] });
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
+
+  it.each(["logout", "remove", "shutdown"])(
+    "discards an expired-session handshake superseded by %s",
+    async (action) => {
+      const harness = await makeHarness();
+      let release!: (client: typeof harness.extended) => void;
+      const fresh = { ...harness.extended, close: jest.fn(async () => {}) };
+      const started = new Promise<void>((resolve) => {
+        harness.createConnection.mockImplementationOnce(
+          () =>
+            new Promise((finish) => {
+              release = finish;
+              resolve();
+            }),
+        );
+      });
+      harness.extended.callTool.mockRejectedValueOnce(
+        new UpstreamSessionExpiredError(),
+      );
+      const call = expect(
+        harness.upstream.callTool("docs", { name: "read" }),
+      ).rejects.toBeInstanceOf(UpstreamSessionExpiredError);
+      try {
+        await started;
+        if (action === "logout")
+          await harness.upstream.logoutOAuthForServer("docs");
+        else if (action === "remove")
+          await harness.upstream.removeClient("docs");
+        else await harness.upstream.shutdown();
+        release(fresh);
+        await call;
+        expect(fresh.close).toHaveBeenCalledTimes(1);
+        expect(fresh.listTools).toHaveBeenCalledTimes(1);
+        if (action !== "shutdown") {
+          expect(
+            harness.registry.servers
+              .get("docs")
+              ?.tools?.some((tool) => tool.definition.name === "read"),
+          ).not.toBe(true);
+        }
+        if (action === "logout")
+          expect(harness.state.export().targetServers[0]?.state.type).toBe(
+            "pending-auth",
+          );
+        if (action === "remove")
+          expect(harness.state.export().targetServers).toHaveLength(0);
+      } finally {
+        await harness.upstream.shutdown();
+      }
+    },
+  );
+
+  it("falls back to normal retries when fresh initialization fails", async () => {
+    jest.useFakeTimers();
+    const harness = await makeHarness();
+    try {
+      harness.extended.callTool.mockRejectedValueOnce(
+        new UpstreamSessionExpiredError(),
+      );
+      harness.createConnection.mockRejectedValueOnce(new Error("offline"));
+      await expect(
+        harness.upstream.callTool("docs", { name: "read" }),
+      ).rejects.toBeInstanceOf(UpstreamSessionExpiredError);
+      expect(harness.state.export().targetServers[0]?.state.type).toBe(
+        "connection-failed",
+      );
+      await jest.advanceTimersByTimeAsync(10);
+      expect(harness.state.export().targetServers[0]?.state.type).toBe(
+        "connected",
+      );
+      expect(harness.createConnection).toHaveBeenCalledTimes(3);
+      expect(harness.extended.callTool).toHaveBeenCalledTimes(1);
+    } finally {
+      await harness.upstream.shutdown();
+      jest.useRealTimers();
+    }
+  });
+
+  it("recovers session expiry reported by a notification stream", async () => {
+    const harness = await makeHarness();
+    let release!: (client: typeof harness.extended) => void;
+    const started = new Promise<void>((resolve) => {
+      harness.createConnection.mockImplementationOnce(
+        () =>
+          new Promise((finish) => {
+            release = finish;
+            resolve();
+          }),
+      );
+    });
+    try {
+      const listeners = [...harness.sessionExpiredListeners];
+      expect(listeners).toHaveLength(1);
+      harness.extended.isAlive.mockResolvedValueOnce(
+        new UpstreamSessionExpiredError(),
+      );
+      listeners[0]!(new UpstreamSessionExpiredError("GET"));
+      listeners[0]!(new UpstreamSessionExpiredError("GET"));
+      await started;
+      expect(harness.createConnection).toHaveBeenCalledTimes(2);
+      expect(harness.extended.isAlive).toHaveBeenCalledTimes(1);
+      expect(harness.extended.isAlive).toHaveBeenCalledWith(100, true);
+      release(harness.extended);
+      for (let step = 0; step < 20; step++) await Promise.resolve();
+      expect(harness.state.export().targetServers[0]?.state.type).toBe(
+        "connected",
+      );
+      expect(harness.sessionExpiredListeners.size).toBe(1);
+      expect(harness.extended.callTool).not.toHaveBeenCalled();
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
+
+  it.each([
+    null,
+    new McpError(ErrorCode.InternalError, "Ping application error"),
+  ])(
+    "keeps a usable POST session after GET 404 and can still recover a later POST expiry (%s)",
+    async (outcome) => {
+      const harness = await makeHarness();
+      try {
+        harness.extended.isAlive.mockResolvedValue(outcome);
+        const listener = [...harness.sessionExpiredListeners][0]!;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          listener(new UpstreamSessionExpiredError("GET"));
+          for (let step = 0; step < 20; step++) await Promise.resolve();
+        }
+        expect(harness.extended.isAlive).toHaveBeenCalledTimes(3);
+        expect(harness.createConnection).toHaveBeenCalledTimes(1);
+        expect(harness.extended.close).not.toHaveBeenCalled();
+        await expect(
+          harness.upstream.callTool("docs", { name: "read" }),
+        ).resolves.toEqual({ content: [] });
+        harness.extended.callTool.mockRejectedValueOnce(
+          new UpstreamSessionExpiredError(),
+        );
+        await expect(
+          harness.upstream.callTool("docs", { name: "read" }),
+        ).rejects.toBeInstanceOf(UpstreamSessionExpiredError);
+        expect(harness.createConnection).toHaveBeenCalledTimes(2);
+      } finally {
+        await harness.upstream.shutdown();
+      }
+    },
+  );
+
+  it("does not restore a removed server after its GET-session probe finishes", async () => {
+    const harness = await makeHarness();
+    let release!: (outcome: PingOutcome) => void;
+    harness.extended.isAlive.mockImplementationOnce(
+      () =>
+        new Promise((finish) => {
+          release = finish;
+        }),
+    );
+    try {
+      [...harness.sessionExpiredListeners][0]!(
+        new UpstreamSessionExpiredError("GET"),
+      );
+      await harness.upstream.removeClient("docs");
+      release(new UpstreamSessionExpiredError());
+      for (let step = 0; step < 20; step++) await Promise.resolve();
+      expect(harness.createConnection).toHaveBeenCalledTimes(1);
+      expect(harness.state.export().targetServers).toHaveLength(0);
+      expect(harness.registry.servers.get("docs")).toBeUndefined();
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
+
+  it("recovers an expired ping without waiting for the failure threshold", async () => {
+    jest.useFakeTimers();
+    const harness = await makeHarness("docs", { pingIntervalMs: 10 });
+    try {
+      harness.extended.isAlive.mockResolvedValueOnce(
+        new UpstreamSessionExpiredError(),
+      );
+      await jest.advanceTimersByTimeAsync(10);
+      expect(harness.createConnection).toHaveBeenCalledTimes(2);
+      expect(harness.state.export().targetServers[0]?.state.type).toBe(
+        "connected",
+      );
+      expect(harness.extended.callTool).not.toHaveBeenCalled();
+    } finally {
+      await harness.upstream.shutdown();
+      jest.useRealTimers();
+    }
+  });
+
+  it("reuses OAuth authentication while replacing an expired MCP session", async () => {
+    const harness = await makeHarness();
+    try {
+      const tokens = await harness.provider.tokens();
+      jest.spyOn(harness.oauth, "hasStaticOAuthForUrl").mockReturnValue(true);
+      const resolveAuth = jest
+        .spyOn(harness.oauth, "resolveExistingAuth")
+        .mockResolvedValue({
+          kind: "connected",
+          client: harness.extended as unknown as ExtendedClientI,
+        });
+      harness.extended.callTool.mockRejectedValueOnce(
+        new UpstreamSessionExpiredError(),
+      );
+      await expect(
+        harness.upstream.callTool("docs", { name: "read" }),
+      ).rejects.toBeInstanceOf(UpstreamSessionExpiredError);
+      expect(resolveAuth).toHaveBeenCalledTimes(1);
+      expect(harness.state.export().targetServers[0]?.state.type).toBe(
+        "connected",
+      );
+      expect(await harness.provider.tokens()).toEqual(tokens);
+      expect(harness.extended.callTool).toHaveBeenCalledTimes(1);
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
+
+  it("does not interpret an application's 404 as an expired HTTP session", async () => {
+    const harness = await makeHarness();
+    try {
+      harness.extended.callTool.mockRejectedValueOnce(
+        new McpError(404, "Recording not found"),
+      );
+      await expect(
+        harness.upstream.callTool("docs", { name: "read" }),
+      ).rejects.toThrow("Recording not found");
+      expect(harness.createConnection).toHaveBeenCalledTimes(1);
+      expect(harness.extended.close).not.toHaveBeenCalled();
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
 
   it.each(["management_update_server", "management_refresh_server"])(
     "%s replaces same-name schemas without replacing connections or credentials",

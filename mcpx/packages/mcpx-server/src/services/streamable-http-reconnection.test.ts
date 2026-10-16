@@ -5,6 +5,7 @@ import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/typ
 import {
   createUpstreamHttpTransport,
   upstreamStreamReconnectionOptions,
+  UpstreamSessionExpiredError,
 } from "./streamable-http-reconnection.js";
 
 jest.setTimeout(15_000);
@@ -29,6 +30,9 @@ describe("upstream HTTP notification recovery", () => {
   let notifications: number;
   let errors: Error[];
   let streams: Set<http.ServerResponse>;
+  let session: string | undefined;
+  let expired: boolean;
+  let initializations: Array<string | undefined>;
 
   beforeEach(async () => {
     getRequests = 0;
@@ -38,7 +42,14 @@ describe("upstream HTTP notification recovery", () => {
     notifications = 0;
     errors = [];
     streams = new Set();
+    session = undefined;
+    expired = false;
+    initializations = [];
     server = http.createServer((request, response) => {
+      if (expired && request.headers["mcp-session-id"]) {
+        response.writeHead(404).end();
+        return;
+      }
       if (request.method === "GET") {
         getRequests++;
         if (holdRequests) return;
@@ -61,6 +72,12 @@ describe("upstream HTTP notification recovery", () => {
       });
       request.on("end", () => {
         const message = JSON.parse(body) as { id?: number; method: string };
+        if (message.method === "initialize") {
+          initializations.push(
+            request.headers["mcp-session-id"] as string | undefined,
+          );
+          if (session) response.setHeader("mcp-session-id", session);
+        }
         if (message.id === undefined) {
           response.writeHead(202).end();
           return;
@@ -111,6 +128,64 @@ describe("upstream HTTP notification recovery", () => {
       );
     }
   }
+
+  it("signals expiry on a stateful POST and initializes a new session without replaying it", async () => {
+    session = "first-session";
+    const transport = createUpstreamHttpTransport(url, {});
+    await client.connect(transport);
+    await waitFor(() => streams.size === 1);
+    expired = true;
+    await expect(client.ping()).rejects.toBeInstanceOf(
+      UpstreamSessionExpiredError,
+    );
+    expect(initializations).toEqual([undefined]);
+    await client.close();
+    expired = false;
+    session = "second-session";
+    client = new Client({ name: "recovery-test", version: "1" });
+    const fresh = createUpstreamHttpTransport(url, {});
+    await client.connect(fresh);
+    await client.ping();
+    expect(fresh.sessionId).toBe("second-session");
+    expect(initializations).toEqual([undefined, undefined]);
+  });
+
+  it("signals expiry from the optional GET notification stream", async () => {
+    session = "first-session";
+    await client.connect(createUpstreamHttpTransport(url, {}));
+    await waitFor(() => streams.size === 1);
+    expired = true;
+    for (const stream of streams) stream.end();
+    await waitFor(() =>
+      errors.some((error) => error instanceof UpstreamSessionExpiredError),
+    );
+  });
+
+  it.each([undefined, "existing-session"])(
+    "keeps ordinary 404 errors distinct when the method is not a session request (%s)",
+    async (sessionId) => {
+      const fetchResponse = jest.fn(
+        async () => new Response(null, { status: 404 }),
+      );
+      const transport = createUpstreamHttpTransport(url, {
+        fetch: fetchResponse,
+        sessionId,
+      });
+      await transport.start();
+      const request = sessionId
+        ? transport.terminateSession()
+        : transport.send({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {},
+          });
+      await expect(request).rejects.not.toBeInstanceOf(
+        UpstreamSessionExpiredError,
+      );
+      await transport.close();
+    },
+  );
 
   it("accepts unsupported optional GET without retrying a healthy server", async () => {
     unsupported = true;

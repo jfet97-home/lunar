@@ -17,6 +17,7 @@ import { z } from "zod";
 import { ZodError } from "zod/v4";
 import { Logger } from "winston";
 import { loggableError } from "@aigw/core/logging";
+import { UpstreamSessionExpiredError } from "./streamable-http-reconnection.js";
 
 // JSON Schema property - the SDK types this as unknown but it's actually a JSON Schema object
 const jsonSchemaPropertySchema = z.object({
@@ -56,7 +57,7 @@ export type OriginalClientI = Pick<
   | "setNotificationHandler"
   | "ping"
 > &
-  Partial<Pick<Client, "getServerVersion">>;
+  Partial<Pick<Client, "getServerVersion" | "onerror">>;
 
 // "method-not-found":
 // -32601 means the server is alive but doesn't implement ping.
@@ -92,9 +93,12 @@ export interface ExtendedClientI {
   getPrompt(
     params: Parameters<Client["getPrompt"]>[0],
   ): ReturnType<Client["getPrompt"]>;
-  isAlive(timeoutMs: number): Promise<PingOutcome>;
+  isAlive(timeoutMs: number, forcePing?: boolean): Promise<PingOutcome>;
   onToolsListChanged(callback: () => void): () => void;
   onPromptsListChanged(callback: () => void): () => void;
+  onSessionExpired?(
+    callback: (error: UpstreamSessionExpiredError) => void,
+  ): () => void;
 }
 
 export class ExtendedClientBuilder {
@@ -126,6 +130,17 @@ export class ExtendedClientBuilder {
 
     const toolsListChangedListeners = new Set<() => void>();
     const promptsListChangedListeners = new Set<() => void>();
+    const sessionExpiredListeners = new Set<
+      (error: UpstreamSessionExpiredError) => void
+    >();
+    const previousOnError = originalClient.onerror;
+    const onError = (error: Error): void => {
+      previousOnError?.(error);
+      if (error instanceof UpstreamSessionExpiredError) {
+        for (const listener of sessionExpiredListeners) listener(error);
+      }
+    };
+    originalClient.onerror = onError;
 
     originalClient.setNotificationHandler(
       ToolListChangedNotificationSchema,
@@ -153,6 +168,9 @@ export class ExtendedClientBuilder {
       async close(): Promise<void> {
         toolsListChangedListeners.clear();
         promptsListChangedListeners.clear();
+        sessionExpiredListeners.clear();
+        if (originalClient.onerror === onError)
+          originalClient.onerror = previousOnError;
         unsubscribeConfig();
         return await extendedClient.close.bind(extendedClient)();
       },
@@ -168,6 +186,12 @@ export class ExtendedClientBuilder {
       onPromptsListChanged(callback: () => void): () => void {
         promptsListChangedListeners.add(callback);
         return () => promptsListChangedListeners.delete(callback);
+      },
+      onSessionExpired(
+        callback: (error: UpstreamSessionExpiredError) => void,
+      ): () => void {
+        sessionExpiredListeners.add(callback);
+        return () => sessionExpiredListeners.delete(callback);
       },
     };
   }
@@ -275,8 +299,8 @@ export class ExtendedClient {
     });
   }
 
-  async isAlive(timeoutMs: number): Promise<PingOutcome> {
-    if (!this.pingSupported) {
+  async isAlive(timeoutMs: number, forcePing = false): Promise<PingOutcome> {
+    if (!this.pingSupported && !forcePing) {
       return "no-signal";
     }
     return this.originalClient

@@ -1,5 +1,6 @@
 // No unit test: this is a god object that interleaves pure decisions, effectful
 import { normalizeServerName } from "@mcpx/toolkit-core/data";
+import { UpstreamSessionExpiredError } from "./streamable-http-reconnection.js";
 
 // collaborator calls, and timers (setTimeout/setInterval/queueMicrotask), so
 // testing any behavior means mocking all ten collaborators and fighting fake
@@ -153,6 +154,7 @@ export class UpstreamHandler
   private readonly reconnectQueue = new Map<string, NodeJS.Timeout>();
   private readonly reconnectAttemptsByServer = new Map<string, number>();
   private readonly reconnectBaseDelayMs: number;
+  private readonly sessionProbeTimeoutMs: number;
   private shuttingDown = false;
   private previousToolExtensions: ToolExtensions["services"] = {};
   private unsubscribeConfig?: () => void;
@@ -160,6 +162,11 @@ export class UpstreamHandler
   private readonly authTargetVersions = new WeakMap<TargetServer, number>();
   private readonly authVersions = new Map<string, number>();
   private readonly logoutOperations = new Map<string, Promise<void>>();
+  private readonly sessionRecoveryByClient = new WeakMap<
+    ConnectedTargetClient,
+    Promise<void>
+  >();
+  private readonly sessionExpiredUnsubscribers = new Map<string, () => void>();
 
   constructor(
     private systemState: SystemStateTracker,
@@ -176,6 +183,7 @@ export class UpstreamHandler
   ) {
     this.logger = logger.child({ component: "UpstreamHandler" });
     this.reconnectBaseDelayMs = config.reconnectBaseDelayMs;
+    this.sessionProbeTimeoutMs = config.pingTimeoutMs;
     this._watchdog = new UpstreamWatchdog(
       {
         pingServer: (name): Promise<PingOutcome> =>
@@ -245,6 +253,8 @@ export class UpstreamHandler
       this.logger.debug(`Refreshed ${kind} for client`, { name });
       return true;
     } catch (e) {
+      if (e instanceof UpstreamSessionExpiredError)
+        await this.recoverExpiredSession(client, e);
       this.logger.error(`Failed to refresh ${kind} for client`, {
         name,
         error: loggableError(e),
@@ -455,6 +465,9 @@ export class UpstreamHandler
       for (const unsub of map.values()) unsub();
       map.clear();
     }
+    for (const unsubscribe of this.sessionExpiredUnsubscribers.values())
+      unsubscribe();
+    this.sessionExpiredUnsubscribers.clear();
 
     this.unsubscribeConfig?.();
     this.unsubscribeConfig = undefined;
@@ -1022,6 +1035,21 @@ export class UpstreamHandler
       this.reconnectAttemptsByServer.delete(normalizedName);
       const serverName = newTargetClient.targetServer.name;
       const ec = newTargetClient.extendedClient;
+      const unsubscribeSessionExpired = ec.onSessionExpired?.((error) => {
+        void this.recoverExpiredSession(newTargetClient, error).catch(
+          (recoveryError) => {
+            this.logger.error("Unexpected upstream session recovery failure", {
+              name: serverName,
+              error: loggableError(recoveryError),
+            });
+          },
+        );
+      });
+      if (unsubscribeSessionExpired)
+        this.sessionExpiredUnsubscribers.set(
+          normalizedName,
+          unsubscribeSessionExpired,
+        );
       this.listChangedUnsubscribers.tools.set(
         normalizedName,
         ec.onToolsListChanged(() =>
@@ -1106,16 +1134,18 @@ export class UpstreamHandler
   private finalizeConnection(
     targetServer: TargetServer,
     extendedClient: ExtendedClientI,
+    isCurrent: () => boolean = () => true,
   ): Promise<TargetClient> {
-    if (this.isAuthTargetRevoked(targetServer)) {
+    if (!isCurrent() || this.isAuthTargetRevoked(targetServer)) {
       return extendedClient.close().then(() => {
         this.assertAuthTargetCurrent(targetServer);
-        throw new Error("Unreachable revoked OAuth connection");
+        throw new Error("Upstream connection was superseded");
       });
     }
     return fetchServerCapabilities(extendedClient, this.logger)
       .then((capabilities): TargetClient => {
         this.assertAuthTargetCurrent(targetServer);
+        if (!isCurrent()) throw new Error("Upstream connection was superseded");
         this.capabilityRegistry.registerServer(
           normalizeServerName(targetServer.name),
           capabilities,
@@ -1132,7 +1162,7 @@ export class UpstreamHandler
             },
           );
         });
-        if (this.isAuthTargetRevoked(targetServer)) {
+        if (!isCurrent() || this.isAuthTargetRevoked(targetServer)) {
           throw e;
         }
         this.logger.warn("Failed to load capabilities on connect", {
@@ -1235,6 +1265,8 @@ export class UpstreamHandler
   }
 
   private dropListChangedSubscriptions(normalizedName: string): void {
+    this.sessionExpiredUnsubscribers.get(normalizedName)?.();
+    this.sessionExpiredUnsubscribers.delete(normalizedName);
     for (const map of Object.values(this.listChangedUnsubscribers)) {
       map.get(normalizedName)?.();
       map.delete(normalizedName);
@@ -1247,7 +1279,97 @@ export class UpstreamHandler
   ): Promise<PingOutcome> {
     const client = this.getConnectedClientByName(name);
     if (!client) return "no-signal";
-    return client.extendedClient.isAlive(timeoutMs);
+    const outcome = await client.extendedClient.isAlive(timeoutMs);
+    if (outcome instanceof UpstreamSessionExpiredError) {
+      await this.recoverExpiredSession(client, outcome);
+      return "no-signal";
+    }
+    if (this.getConnectedClientByName(name) !== client) return "no-signal";
+    return outcome;
+  }
+
+  private recoverExpiredSession(
+    client: ConnectedTargetClient,
+    error: UpstreamSessionExpiredError,
+  ): Promise<void> {
+    const existing = this.sessionRecoveryByClient.get(client);
+    if (existing) return existing;
+    const recovery = this.runSessionRecovery(client, error).finally(() => {
+      if (this.getConnectedClientByName(client.targetServer.name) === client)
+        this.sessionRecoveryByClient.delete(client);
+    });
+    this.sessionRecoveryByClient.set(client, recovery);
+    return recovery;
+  }
+
+  private async runSessionRecovery(
+    client: ConnectedTargetClient,
+    error: UpstreamSessionExpiredError,
+  ): Promise<void> {
+    const { targetServer } = client;
+    const name = normalizeServerName(targetServer.name);
+    if (
+      this.shuttingDown ||
+      targetServer.type !== "streamable-http" ||
+      this._clientsByService.get(name) !== client ||
+      this.isAuthTargetRevoked(targetServer)
+    )
+      return;
+    if (error.requestMethod === "GET") {
+      const outcome = await client.extendedClient.isAlive(
+        this.sessionProbeTimeoutMs,
+        true,
+      );
+      if (
+        outcome === null ||
+        (outcome instanceof Error &&
+          !isTransportError(outcome) &&
+          !isAuthenticationError(outcome))
+      )
+        return;
+      if (
+        this.shuttingDown ||
+        this._clientsByService.get(name) !== client ||
+        this.isAuthTargetRevoked(targetServer)
+      )
+        return;
+    }
+    const connecting: TargetClient = { _state: "connecting", targetServer };
+    const isCurrent = (): boolean =>
+      !this.shuttingDown &&
+      this._clientsByService.get(name) === connecting &&
+      !this.isAuthTargetRevoked(targetServer);
+    this.logger.info(
+      "Upstream session expired, initializing a fresh connection",
+      { name },
+    );
+    try {
+      await this.recordClientUpsert(connecting);
+      await client.extendedClient.close().catch((closeError) => {
+        this.logger.warn("Failed to close expired upstream session", {
+          name,
+          error: loggableError(closeError),
+        });
+      });
+      if (!isCurrent()) return;
+      const recovered = await this.safeInitiateClient(targetServer, isCurrent);
+      if (!isCurrent()) {
+        if (isConnected(recovered)) await recovered.extendedClient.close();
+        return;
+      }
+      await this.recordClientUpsert(recovered);
+    } catch (recoveryError) {
+      this.logger.warn("Failed to recover expired upstream session", {
+        name,
+        error: loggableError(recoveryError),
+      });
+      if (isCurrent())
+        await this.recordClientUpsert({
+          _state: "connection-failed",
+          targetServer,
+          error,
+        });
+    }
   }
 
   private async onServerUnreachable(
@@ -1449,6 +1571,7 @@ export class UpstreamHandler
   // Should always return a resolved Promise.
   private async safeInitiateClient(
     targetServer: TargetServer,
+    isCurrent: () => boolean = () => true,
   ): Promise<TargetClient> {
     // Error might be a connection error, either on an initial connection
     // or when retrying with OAuth.
@@ -1489,7 +1612,7 @@ export class UpstreamHandler
         { name: targetServer.name },
       );
       try {
-        return await this.initiateRemoteUnauthedClient(targetServer);
+        return await this.initiateRemoteUnauthedClient(targetServer, isCurrent);
       } catch (oauthError) {
         return {
           _state: "connection-failed",
@@ -1506,9 +1629,15 @@ export class UpstreamHandler
         // Watermark headers from the catalog (see privateHeadersSchema).
         catalogServer?.adminConfig?.privateHeaders,
       );
-      return await this.finalizeConnection(targetServer, extendedClient);
+      return await this.finalizeConnection(
+        targetServer,
+        extendedClient,
+        isCurrent,
+      );
     } catch (initialError) {
       error = makeError(initialError);
+      if (!isCurrent())
+        return { _state: "connection-failed", targetServer, error };
 
       // Check for pending input (missing env vars)
       if (isPendingInputError(initialError)) {
@@ -1537,7 +1666,10 @@ export class UpstreamHandler
         // Attempt OAuth - this will try static OAuth if configured, or DCR as fallback
         // If the provider can't be created (e.g., missing credentials), it will throw
         try {
-          return await this.initiateRemoteUnauthedClient(targetServer);
+          return await this.initiateRemoteUnauthedClient(
+            targetServer,
+            isCurrent,
+          );
         } catch (oauthError) {
           error = makeError(oauthError);
           // Proceed to return connection-failed below
@@ -1587,9 +1719,20 @@ export class UpstreamHandler
     const { name } = client.targetServer;
     try {
       const result = await action(client.extendedClient);
-      this._watchdog.reportSuccess(normalizeServerName(name));
+      if (this.getConnectedClientByName(name) === client)
+        this._watchdog.reportSuccess(normalizeServerName(name));
       return result;
     } catch (e) {
+      if (e instanceof UpstreamSessionExpiredError) {
+        await this.recoverExpiredSession(client, e);
+        throw e;
+      }
+      const sessionRecovery = this.sessionRecoveryByClient.get(client);
+      if (sessionRecovery) {
+        await sessionRecovery;
+        throw e;
+      }
+      if (this.getConnectedClientByName(name) !== client) throw e;
       // any answer, even an error one, proves the server is reachable. Only a
       // transport failure counts against it, and the watchdog threshold decides.
       if (
@@ -1718,9 +1861,14 @@ export class UpstreamHandler
   // itself lives in OAuthConnectionHandler.
   private async initiateRemoteUnauthedClient(
     targetServer: RemoteTargetServer,
+    isCurrent: () => boolean = () => true,
   ): Promise<TargetClient> {
     const verdict =
       await this.oauthConnectionHandler.resolveExistingAuth(targetServer);
+    if (!isCurrent()) {
+      if (verdict.kind === "connected") await verdict.client.close();
+      throw new Error("Upstream connection was superseded");
+    }
     const log = { name: targetServer.name, type: targetServer.type };
 
     switch (verdict.kind) {
@@ -1728,8 +1876,8 @@ export class UpstreamHandler
         const connected = await this.finalizeConnection(
           targetServer,
           verdict.client,
+          isCurrent,
         );
-        await this.recordClientUpsert(connected);
         return connected;
       }
       case "not-oauth":

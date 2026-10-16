@@ -24,6 +24,23 @@ handshakes and capability discovery, **not failed tool calls**. A rebooted
 upstream normally needs no gateway restart or token replacement. DNS and network
 reachability remain prerequisites.
 
+An HTTP 404 on a request carrying `MCP-Session-Id` means the upstream session
+has expired, commonly after a restart. MCPX immediately replaces that connection
+and initializes without the old session ID, retaining the URL, headers and saved
+authentication. Concurrent expiry signals share one recovery attempt. This also
+applies to pings and optional notification streams; initialization errors without
+a session ID and ordinary tool errors do not trigger this path.
+
+For an optional GET returning 404, MCPX first sends a bounded ping on the same
+session. A usable POST session is retained: some servers incorrectly answer an
+unsupported GET with 404 rather than 405. This avoids repeated initialization on
+those servers. If the ping also fails, the normal session-replacement path runs.
+
+The interrupted tool call still fails and is never replayed automatically. Check
+the outcome of a write before submitting it again. If initialization fails, normal
+connection retries continue. Removal, logout, configuration replacement or shutdown
+supersedes recovery; a late handshake cannot restore an obsolete connection.
+
 ## Retry one server now
 
 Call `mcpx__management_reconnect_server` with `{ "name": "your-server" }` to
