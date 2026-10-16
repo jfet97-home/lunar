@@ -41,6 +41,8 @@ The interrupted tool call still fails and is never replayed automatically. Check
 the outcome of a write before submitting it again. If initialization fails, normal
 connection retries continue. Removal, logout, configuration replacement or shutdown
 supersedes recovery; a late handshake cannot restore an obsolete connection.
+The interrupted call waits for recovery and can surface the SDK's generic
+`Connection closed` error rather than the original HTTP 404.
 
 ## Retry one server now
 

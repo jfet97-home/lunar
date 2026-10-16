@@ -1293,7 +1293,15 @@ export class UpstreamHandler
     error: UpstreamSessionExpiredError,
   ): Promise<void> {
     const existing = this.sessionRecoveryByClient.get(client);
-    if (existing) return existing;
+    if (existing) {
+      if (error.requestMethod === "GET") return existing;
+      return existing.then(() => {
+        if (this.getConnectedClientByName(client.targetServer.name) === client)
+          return this.recoverExpiredSession(client, error);
+        const latest = this.sessionRecoveryByClient.get(client);
+        return latest !== existing ? latest : undefined;
+      });
+    }
     const recovery = this.runSessionRecovery(client, error).finally(() => {
       if (this.getConnectedClientByName(client.targetServer.name) === client)
         this.sessionRecoveryByClient.delete(client);
@@ -1511,7 +1519,10 @@ export class UpstreamHandler
     await this.recordClientUpsert({ _state: "connecting", targetServer });
 
     const newClient = await this.safeInitiateClient(targetServer);
-    if (this.isAuthTargetRevoked(targetServer)) return false;
+    if (this.isAuthTargetRevoked(targetServer)) {
+      if (isConnected(newClient)) await newClient.extendedClient.close();
+      return false;
+    }
     await this.recordClientUpsert(newClient);
 
     this.logger.debug("Upstream server reconnect attempt finished", {
@@ -1729,12 +1740,12 @@ export class UpstreamHandler
       return result;
     } catch (e) {
       if (e instanceof UpstreamSessionExpiredError) {
-        await this.recoverExpiredSession(client, e);
+        await this.recoverExpiredSession(client, e).catch(() => undefined);
         throw e;
       }
       const sessionRecovery = this.sessionRecoveryByClient.get(client);
-      if (sessionRecovery) {
-        await sessionRecovery;
+      if (sessionRecovery && this.getConnectedClientByName(name) !== client) {
+        await sessionRecovery.catch(() => undefined);
         throw e;
       }
       if (this.getConnectedClientByName(name) !== client) throw e;

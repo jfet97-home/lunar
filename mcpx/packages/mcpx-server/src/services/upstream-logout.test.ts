@@ -578,6 +578,76 @@ describe("upstream recovery and OAuth logout", () => {
     }
   });
 
+  it("still replaces an expired POST session when it overlaps a successful GET probe", async () => {
+    const harness = await makeHarness();
+    let release!: (outcome: PingOutcome) => void;
+    harness.extended.isAlive.mockImplementationOnce(
+      () =>
+        new Promise((finish) => {
+          release = finish;
+        }),
+    );
+    try {
+      [...harness.sessionExpiredListeners][0]!(
+        new UpstreamSessionExpiredError("GET"),
+      );
+      const postStarted = new Promise<void>((resolve) => {
+        harness.extended.callTool.mockImplementationOnce(async () => {
+          resolve();
+          throw new UpstreamSessionExpiredError();
+        });
+      });
+      const failed = expect(
+        harness.upstream.callTool("docs", { name: "read" }),
+      ).rejects.toBeInstanceOf(UpstreamSessionExpiredError);
+      await postStarted;
+      for (let step = 0; step < 20; step++) await Promise.resolve();
+      release(null);
+      await failed;
+      expect(harness.createConnection).toHaveBeenCalledTimes(2);
+      expect(harness.state.export().targetServers[0]?.state.type).toBe(
+        "connected",
+      );
+      expect(harness.extended.callTool).toHaveBeenCalledTimes(1);
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
+
+  it("does not suppress OAuth recovery while an optional GET probe is pending", async () => {
+    const harness = await makeHarness();
+    let release!: (outcome: PingOutcome) => void;
+    harness.extended.isAlive.mockImplementationOnce(
+      () =>
+        new Promise((finish) => {
+          release = finish;
+        }),
+    );
+    try {
+      [...harness.sessionExpiredListeners][0]!(
+        new UpstreamSessionExpiredError("GET"),
+      );
+      harness.extended.callTool.mockRejectedValueOnce(
+        new Error("401 Unauthorized"),
+      );
+      const authRecovery = jest
+        .spyOn(harness.oauth, "safeTryWithExistingTokens")
+        .mockResolvedValue(harness.extended as unknown as ExtendedClientI);
+      await expect(
+        harness.upstream.callTool("docs", { name: "read" }),
+      ).resolves.toEqual({ content: [] });
+      expect(authRecovery).toHaveBeenCalledTimes(1);
+      release(new UpstreamSessionExpiredError());
+      for (let step = 0; step < 20; step++) await Promise.resolve();
+      expect(harness.createConnection).toHaveBeenCalledTimes(1);
+      expect(harness.state.export().targetServers[0]?.state.type).toBe(
+        "connected",
+      );
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
+
   it("recovers an expired ping without waiting for the failure threshold", async () => {
     jest.useFakeTimers();
     const harness = await makeHarness("docs", { pingIntervalMs: 10 });
