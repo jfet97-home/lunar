@@ -34,7 +34,8 @@ a session ID and ordinary tool errors do not trigger this path.
 For an optional GET returning 404, MCPX first sends a bounded ping on the same
 session. A usable POST session is retained: some servers incorrectly answer an
 unsupported GET with 404 rather than 405. This avoids repeated initialization on
-those servers. If the ping also fails, the normal session-replacement path runs.
+those servers. A ping that also confirms session expiry triggers replacement;
+other probe failures use the normal watchdog thresholds and reconnect backoff.
 
 The interrupted tool call still fails and is never replayed automatically. Check
 the outcome of a write before submitting it again. If initialization fails, normal

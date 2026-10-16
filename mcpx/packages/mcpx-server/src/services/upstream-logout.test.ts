@@ -557,6 +557,27 @@ describe("upstream recovery and OAuth logout", () => {
     }
   });
 
+  it("uses normal failure thresholds for unconfirmed GET expiry instead of repeatedly initializing", async () => {
+    const harness = await makeHarness();
+    harness.extended.isAlive.mockResolvedValue(new Error("HTTP 503 from ping"));
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        [...harness.sessionExpiredListeners][0]!(
+          new UpstreamSessionExpiredError("GET"),
+        );
+        for (let step = 0; step < 20; step++) await Promise.resolve();
+      }
+      expect(harness.createConnection).toHaveBeenCalledTimes(1);
+      expect(harness.extended.close).not.toHaveBeenCalled();
+      expect(harness.extended.isAlive).toHaveBeenCalledTimes(2);
+      await expect(
+        harness.upstream.callTool("docs", { name: "read" }),
+      ).resolves.toEqual({ content: [] });
+    } finally {
+      await harness.upstream.shutdown();
+    }
+  });
+
   it("recovers an expired ping without waiting for the failure threshold", async () => {
     jest.useFakeTimers();
     const harness = await makeHarness("docs", { pingIntervalMs: 10 });

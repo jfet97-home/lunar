@@ -1333,6 +1333,11 @@ export class UpstreamHandler
         this.isAuthTargetRevoked(targetServer)
       )
         return;
+      if (!(outcome instanceof UpstreamSessionExpiredError)) {
+        if (outcome instanceof Error)
+          this._watchdog.reportFailure(name, outcome);
+        return;
+      }
     }
     const connecting: TargetClient = { _state: "connecting", targetServer };
     const isCurrent = (): boolean =>
