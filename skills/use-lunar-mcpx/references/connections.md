@@ -1,5 +1,11 @@
 # Connection and authorization
 
+A missing integration is a setup question, not permission to provision a service.
+For a new connection or changed deployment architecture, follow
+`mcp-service-setup` before any package, configuration or process changes. Establish
+the repository, runtime, access and startup choices with the user; reuse explicit
+answers instead of re-asking them during an approved setup.
+
 Use management tools advertised by the current client. The names below are gateway
 names; the client may add a namespace prefix. Inspect their supplied schemas first.
 
