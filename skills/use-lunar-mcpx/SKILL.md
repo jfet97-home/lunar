@@ -10,17 +10,6 @@ the current client; available integrations and permissions are installation-spec
 No source checkout, Docker inspection or local maintenance script is needed for
 normal tool usage. Client namespaces can add prefixes to the names below.
 
-## Adding a new integration
-
-A request to add, install or connect a new MCP uses
-[MCP service setup](../mcp-service-setup/SKILL.md) first. Ask the unresolved setup
-questions one at a time and wait for answers before changing configuration,
-installing packages or starting a service. Agree source placement, private state,
-access, transport and lifecycle; a generic installation request does not authorize
-a host daemon or automatic startup. Use the maintenance skill for an approved
-local deployment. Existing tool reads and already-authorized repairs do not need
-to repeat the intake.
-
 ## Discover and call upstream tools
 
 On the lazy endpoint, start with `mcpx_list_servers({})` when advertised. It lists
