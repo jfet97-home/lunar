@@ -19,6 +19,13 @@ is healthy. They never reset failed-ping history; without a recent heartbeat the
 count as failures, including on servers that do not implement ping.
 Unexpected recovery errors are caught and retried rather than escaping the timer.
 
+An OAuth connection or silent re-authentication that receives HTTP 429 preserves
+tokens and enters pending-auth instead of retrying. A temporarily unavailable
+token store remains a connection failure and retries without deleting credentials.
+Connection attempts load capabilities through `TargetClientConnector`; the handler
+commits them with the client state only if that attempt is still current. Expired
+session recovery also checks for supersession before and after capability loading.
+
 Recovery retains saved configuration and authentication. It retries connection
 handshakes and capability discovery, **not failed tool calls**. A rebooted
 upstream normally needs no gateway restart or token replacement. DNS and network

@@ -308,6 +308,8 @@ export class Services {
       return buildUsageStatsPayload(systemState);
     }
 
+    const oauthCallbackUrl = `${env.MCPX_SERVER_URL}/auth/callback`;
+
     this._hubService = new HubService(
       logger,
       this._setupManager,
@@ -322,6 +324,7 @@ export class Services {
         hubUrl: options.hubUrl,
         connectionTimeout: env.HUB_CONNECTION_TIMEOUT_MS,
         reconnectionDelayMax: env.HUB_RECONNECT_DELAY_MAX_MS,
+        oauthCallbackUrl,
       },
     );
 
@@ -379,7 +382,7 @@ export class Services {
     this._oauthTools = new OAuthToolsService(
       this._upstreamHandler,
       this._permissionManager,
-      `${env.MCPX_SERVER_URL}/auth/callback`,
+      oauthCallbackUrl,
     );
 
     this._internalCapabilities = new InternalCapabilitiesService(logger);

@@ -1,5 +1,7 @@
+import { describe, expect, it, jest } from "@jest/globals";
 import { noOpLogger } from "@aigw/core/logging";
 import { OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import {
   McpxOAuthProviderI,
   OAuthProviderType,
@@ -9,6 +11,7 @@ import { ExtendedClientBuilderI, ExtendedClientI } from "./client-extension.js";
 import { InvalidGrantError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import {
   describeClientIdentity,
+  ExistingTokensResult,
   isAuthenticationError,
   isInvalidGrantError,
   OAuthConnectionHandler,
@@ -17,7 +20,11 @@ import {
 import { discoverAuthorizationServerMetadata } from "@modelcontextprotocol/sdk/client/auth.js";
 import { PublishedClientMetadata } from "@mcpx/toolkit-core/oauth";
 import { StaticOAuthProvider } from "../oauth-providers/static.js";
-import { OAuthTokenStoreI } from "./oauth-token-store.js";
+import { DcrOAuthProvider } from "../oauth-providers/dcr.js";
+import {
+  OAuthTokenStoreI,
+  TokenStoreUnavailableError,
+} from "./oauth-token-store.js";
 
 type AuthorizationServerMeta = Awaited<
   ReturnType<typeof discoverAuthorizationServerMetadata>
@@ -141,7 +148,7 @@ describe("OAuthConnectionHandler", () => {
         redirectToAuthorization: async (_url: URL) => {},
         saveCodeVerifier: async (_verifier: string) => {},
         codeVerifier: async () => "",
-        setDiscoveredScope: () => {},
+        setDiscoveredScopes: () => {},
         setExtraAuthorizationParams: () => {},
         ...overrides,
       } as McpxOAuthProviderI;
@@ -522,7 +529,7 @@ describe("OAuthConnectionHandler", () => {
         url: "https://example.com",
       };
 
-      it("returns undefined and does NOT create a provider when no in-session provider and no persisted tokens exist", async () => {
+      it("reports failed and does NOT create a provider when no in-session provider and no persisted tokens exist", async () => {
         // RND-483 Bug 2: prior impl created a DCR provider unconditionally,
         // which made every 401 look like an OAuth handshake.
         const provider = createMockProvider();
@@ -543,7 +550,7 @@ describe("OAuthConnectionHandler", () => {
         );
 
         const result = await handler.safeTryWithExistingTokens(remoteServer);
-        expect(result).toBeUndefined();
+        expect(result).toEqual({ kind: "failed" });
         expect(getOrCreateCalled).toBe(false);
       });
 
@@ -570,17 +577,17 @@ describe("OAuthConnectionHandler", () => {
         expect(getOrCreateCalled).toBe(true);
       });
 
-      it("returns undefined (does not throw) when the token store is unreachable", async () => {
+      it("reports an unavailable token store without creating a provider", async () => {
         // RND-483: hasPersistedOAuthTokens is a hub round-trip in enterprise.
-        // A hub disconnect must not escape this "safe" method — it should be
-        // treated like any transient error: preserve state, return undefined.
+        // An unavailable store must preserve uncertainty about stored tokens
+        // and leave provider creation to a later successful read.
         const provider = createMockProvider();
         let getOrCreateCalled = false;
         const sessionManager: OAuthSessionManagerI = {
           ...createMockSessionManager(provider),
           getExistingOAuthProvider: () => undefined,
           hasPersistedOAuthTokens: async () => {
-            throw new Error("Hub not connected");
+            throw new TokenStoreUnavailableError("Hub not connected");
           },
           getOrCreateOAuthProvider: () => {
             getOrCreateCalled = true;
@@ -594,8 +601,93 @@ describe("OAuthConnectionHandler", () => {
         );
 
         const result = await handler.safeTryWithExistingTokens(remoteServer);
-        expect(result).toBeUndefined();
+        expect(result).toEqual({
+          kind: "token-store-unavailable",
+          error: expect.any(TokenStoreUnavailableError),
+        });
         expect(getOrCreateCalled).toBe(false);
+      });
+
+      describe("when the connect fails with an upstream error", () => {
+        function buildHandler(connectError: unknown): {
+          handler: OAuthConnectionHandler;
+          deletedTokensFor: string[];
+        } {
+          const provider = createMockProvider({
+            tokens: async () =>
+              ({ access_token: "t", token_type: "Bearer" }) as OAuthTokens,
+          });
+          const deletedTokensFor: string[] = [];
+          const sessionManager: OAuthSessionManagerI = {
+            ...createMockSessionManager(provider),
+            getExistingOAuthProvider: () => provider,
+            deleteOAuthTokensForServer: async (serverName) => {
+              deletedTokensFor.push(serverName);
+            },
+          };
+          const handler = new OAuthConnectionHandler(
+            sessionManager,
+            createMockExtendedClientBuilder(),
+            noOpLogger,
+          );
+          jest
+            .spyOn(
+              handler as unknown as { buildTransport: () => Transport },
+              "buildTransport",
+            )
+            .mockReturnValue({
+              start: async () => {
+                throw connectError;
+              },
+              send: async () => {},
+              close: async () => {},
+            });
+          return { handler, deletedTokensFor };
+        }
+
+        it("reports rate-limited for a 429 and keeps the tokens", async () => {
+          const { handler, deletedTokensFor } = buildHandler(
+            Object.assign(new Error("HTTP 429: Too Many Requests"), {
+              code: 429,
+            }),
+          );
+
+          const result = await handler.safeTryWithExistingTokens(remoteServer);
+
+          expect(result).toEqual({ kind: "rate-limited" });
+          expect(deletedTokensFor).toEqual([]);
+        });
+
+        it("deletes the tokens for a 401", async () => {
+          const { handler, deletedTokensFor } = buildHandler(
+            Object.assign(new Error("HTTP 401: Unauthorized"), { code: 401 }),
+          );
+
+          await handler.safeTryWithExistingTokens(remoteServer);
+
+          expect(deletedTokensFor).toEqual([TEST_SERVER_NAME]);
+        });
+
+        it("deletes the tokens for an invalid_grant", async () => {
+          const { handler, deletedTokensFor } = buildHandler(
+            new InvalidGrantError("dead refresh token"),
+          );
+
+          await handler.safeTryWithExistingTokens(remoteServer);
+
+          expect(deletedTokensFor).toEqual([TEST_SERVER_NAME]);
+        });
+
+        it("reports failed and keeps the tokens for any other error", async () => {
+          const { handler, deletedTokensFor } = buildHandler(
+            new Error("connect ECONNREFUSED"),
+          );
+
+          const result = await handler.safeTryWithExistingTokens(remoteServer);
+
+          expect(result).toEqual({ kind: "failed" });
+          expect(deletedTokensFor).toEqual([]);
+        });
       });
     });
 
@@ -611,6 +703,7 @@ describe("OAuthConnectionHandler", () => {
       // run for real via the session-manager / discovery mocks.
       function buildHandler(opts: {
         reuseSucceeds?: boolean;
+        reuseRateLimited?: boolean;
         hasContext?: boolean;
         tokensValid?: boolean;
         advertisesOAuth?: boolean;
@@ -648,9 +741,12 @@ describe("OAuthConnectionHandler", () => {
           discovery,
         );
         const client = { close: async () => {} } as unknown as ExtendedClientI;
+        const reuseResult: ExistingTokensResult = opts.reuseSucceeds
+          ? { kind: "connected", client }
+          : { kind: opts.reuseRateLimited ? "rate-limited" : "failed" };
         jest
           .spyOn(handler, "safeTryWithExistingTokens")
-          .mockResolvedValue(opts.reuseSucceeds ? client : undefined);
+          .mockResolvedValue(reuseResult);
         return { handler, client };
       }
 
@@ -658,6 +754,16 @@ describe("OAuthConnectionHandler", () => {
         const { handler, client } = buildHandler({ reuseSucceeds: true });
         const verdict = await handler.resolveExistingAuth(remoteServer);
         expect(verdict).toEqual({ kind: "connected", client });
+      });
+
+      it("returns rate-limited when the stored-token connect is rate limited", async () => {
+        const { handler } = buildHandler({
+          reuseRateLimited: true,
+          hasContext: true,
+          tokensValid: true,
+        });
+        const verdict = await handler.resolveExistingAuth(remoteServer);
+        expect(verdict).toEqual({ kind: "rate-limited" });
       });
 
       it("returns not-oauth when reuse fails and the server advertises no OAuth metadata", async () => {
@@ -699,6 +805,91 @@ describe("OAuthConnectionHandler", () => {
         const verdict = await handler.resolveExistingAuth(remoteServer);
         expect(verdict.kind).toBe("needs-auth");
       });
+
+      // Advertises OAuth without requiring real network discovery.
+      const oauthDiscovery: OAuthDiscovery = {
+        discoverOAuthProtectedResourceMetadata: async () =>
+          ({
+            resource: remoteServer.url,
+            authorization_servers: [],
+          }) as Awaited<
+            ReturnType<OAuthDiscovery["discoverOAuthProtectedResourceMetadata"]>
+          >,
+        discoverAuthorizationServerMetadata: async () => undefined,
+      };
+
+      it("reports token-store unavailability without polling or creating a provider", async () => {
+        // A Hub disconnect while the instance starts makes the persisted-token
+        // check throw. Stored tokens may exist, so this must not ask the user
+        // to sign in again.
+        let checks = 0;
+        const sessionManager: OAuthSessionManagerI = {
+          ...createMockSessionManager(createMockProvider()),
+          getExistingOAuthProvider: () => undefined,
+          hasPersistedOAuthTokens: async () => {
+            checks++;
+            throw new TokenStoreUnavailableError("Hub not connected");
+          },
+        };
+        const handler = new OAuthConnectionHandler(
+          sessionManager,
+          createMockExtendedClientBuilder(),
+          noOpLogger,
+          oauthDiscovery,
+        );
+
+        const verdict = await handler.resolveExistingAuth(remoteServer);
+        expect(verdict.kind).toBe("token-store-unavailable");
+        expect(checks).toBe(1);
+      });
+
+      it("preserves a token-store failure from an existing provider", async () => {
+        const error = new TokenStoreUnavailableError("Hub not connected");
+        const provider = createMockProvider({
+          tokens: async () => {
+            throw error;
+          },
+        });
+        const handler = new OAuthConnectionHandler(
+          {
+            ...createMockSessionManager(provider),
+            getExistingOAuthProvider: () => provider,
+          },
+          createMockExtendedClientBuilder(),
+          noOpLogger,
+          oauthDiscovery,
+        );
+
+        expect(await handler.resolveExistingAuth(remoteServer)).toEqual({
+          kind: "token-store-unavailable",
+          error,
+        });
+      });
+
+      it("treats an answer the token store gave as no tokens, without checking again", async () => {
+        // The store was reached but its data can't be used (e.g. an invalid
+        // stored payload). Asking to sign in replaces it; checking again would
+        // get the same answer.
+        let checks = 0;
+        const sessionManager: OAuthSessionManagerI = {
+          ...createMockSessionManager(createMockProvider()),
+          getExistingOAuthProvider: () => undefined,
+          hasPersistedOAuthTokens: async () => {
+            checks++;
+            throw new Error("Invalid tokens payload from hub");
+          },
+        };
+        const handler = new OAuthConnectionHandler(
+          sessionManager,
+          createMockExtendedClientBuilder(),
+          noOpLogger,
+          oauthDiscovery,
+        );
+
+        const verdict = await handler.resolveExistingAuth(remoteServer);
+        expect(verdict.kind).toBe("needs-auth");
+        expect(checks).toBe(1);
+      });
     });
 
     describe(".initiateOAuth", () => {
@@ -708,7 +899,7 @@ describe("OAuthConnectionHandler", () => {
         url: "https://example.com/mcp",
       };
 
-      // Discovery is stubbed away so applyDiscoveredScope makes no network calls.
+      // Discovery is stubbed away so applyDiscoveredScopes makes no network calls.
       function buildHandler(opts: {
         provider: McpxOAuthProviderI;
         auth: NonNullable<OAuthDiscovery["auth"]>;
@@ -768,6 +959,15 @@ describe("OAuthConnectionHandler", () => {
       > = async (provider) => {
         await provider.redirectToAuthorization(
           new URL("https://accounts.google.com/o/oauth2/v2/auth"),
+        );
+        return "REDIRECT";
+      };
+
+      const recordSdkConsentAuthorizationUrl: NonNullable<
+        OAuthDiscovery["auth"]
+      > = async (provider) => {
+        await provider.redirectToAuthorization(
+          new URL("https://auth.example.com/authorize?prompt=consent"),
         );
         return "REDIRECT";
       };
@@ -846,12 +1046,82 @@ describe("OAuthConnectionHandler", () => {
           );
           expect(
             authorizationUrl.searchParams.get("prompt")?.split(" "),
-          ).toEqual(["consent", "select_account"]);
+          ).toEqual(["consent"]);
           expect(provider.clientMetadata.scope).toBe(
             scopesSupported ? "openid offline_access" : "openid",
           );
         },
       );
+
+      it.each([
+        {
+          supported: ["select_account", "consent"],
+          expected: "consent select_account",
+        },
+        { supported: ["consent"], expected: "consent" },
+        { supported: [], expected: null },
+        { supported: undefined, expected: null },
+        { supported: "select_account", expected: null },
+        { supported: ["select_account", 42], expected: null },
+      ])(
+        "selects prompt from metadata $supported",
+        async ({ supported, expected }) => {
+          const handler = buildHandler({
+            provider: createStaticProvider(),
+            auth: recordSdkConsentAuthorizationUrl,
+            authMeta: {
+              issuer: "https://auth.example.com",
+              authorization_endpoint: "https://auth.example.com/authorize",
+              response_types_supported: ["code"],
+              token_endpoint: "https://auth.example.com/token",
+              scopes_supported: ["openid", "offline_access"],
+              prompt_values_supported: supported,
+            } as AuthorizationServerMeta,
+          });
+          const result = await handler.initiateOAuth(remoteServer);
+          expect(
+            new URL(result.authorizationUrl).searchParams.get("prompt"),
+          ).toBe(expected);
+        },
+      );
+
+      it("does not add consent when the SDK did not request it", async () => {
+        const handler = buildHandler({
+          provider: createStaticProvider(),
+          auth: recordAuthorizationUrl,
+          authMeta: {
+            issuer: "https://auth.example.com",
+            authorization_endpoint: "https://auth.example.com/authorize",
+            token_endpoint: "https://auth.example.com/token",
+            response_types_supported: ["code"],
+            prompt_values_supported: ["consent"],
+          } as AuthorizationServerMeta,
+        });
+
+        const result = await handler.initiateOAuth(remoteServer);
+        expect(
+          new URL(result.authorizationUrl).searchParams.has("prompt"),
+        ).toBe(false);
+      });
+
+      it("combines Google consent with advertised account selection", async () => {
+        const handler = buildHandler({
+          provider: createStaticProvider(),
+          auth: recordAuthorizationUrl,
+          authMeta: {
+            issuer: "https://accounts.google.com",
+            authorization_endpoint:
+              "https://accounts.google.com/o/oauth2/v2/auth",
+            response_types_supported: ["code"],
+            token_endpoint: "https://accounts.google.com/token",
+            prompt_values_supported: ["consent", "select_account"],
+          } as AuthorizationServerMeta,
+        });
+        const result = await handler.initiateOAuth(remoteServer);
+        expect(
+          new URL(result.authorizationUrl).searchParams.get("prompt"),
+        ).toBe("consent select_account");
+      });
 
       it("keeps offline_access scope behavior separate for non-Google issuers", async () => {
         const provider = createStaticProvider();
@@ -870,11 +1140,48 @@ describe("OAuthConnectionHandler", () => {
         const authorizationUrl = new URL(result.authorizationUrl);
 
         expect(authorizationUrl.searchParams.get("access_type")).toBeNull();
-        expect(authorizationUrl.searchParams.get("prompt")).toBe(
-          "select_account",
-        );
+        expect(authorizationUrl.searchParams.get("prompt")).toBeNull();
         expect(provider.clientMetadata.scope).toBe("openid offline_access");
       });
+
+      it.each([
+        [["openid", "offline_access", "admin"], "openid offline_access"],
+        [["offline_access"], "offline_access"],
+        [["openid"], undefined],
+      ])(
+        "discovers DCR identity and offline scopes from %j",
+        async (scopesSupported, expectedScope) => {
+          const provider = new DcrOAuthProvider({
+            serverName: TEST_SERVER_NAME,
+            callbackUrl: "http://localhost:9523/oauth/callback",
+            logger: noOpLogger,
+            tokenStore: {
+              loadTokens: async () => undefined,
+              saveTokens: async () => {},
+              loadCodeVerifier: async () => undefined,
+              saveCodeVerifier: async () => {},
+              loadClientInfo: async () => undefined,
+              saveClientInfo: async () => {},
+              deleteAll: async () => {},
+            },
+          });
+          const handler = buildHandler({
+            provider,
+            auth: recordAuthorizationUrl,
+            authMeta: {
+              issuer: "https://mcp.logrocket.com",
+              authorization_endpoint:
+                "https://mcp.logrocket.com/oauth/authorize",
+              response_types_supported: ["code"],
+              scopes_supported: scopesSupported,
+            } as AuthorizationServerMeta,
+          });
+
+          await handler.initiateOAuth(remoteServer);
+
+          expect(provider.clientMetadata.scope).toBe(expectedScope);
+        },
+      );
 
       it.each([
         ["missing metadata", undefined],
@@ -891,9 +1198,7 @@ describe("OAuthConnectionHandler", () => {
         const authorizationUrl = new URL(result.authorizationUrl);
 
         expect(authorizationUrl.searchParams.get("access_type")).toBeNull();
-        expect(authorizationUrl.searchParams.get("prompt")).toBe(
-          "select_account",
-        );
+        expect(authorizationUrl.searchParams.get("prompt")).toBeNull();
       });
 
       it("clears Google defaults when a reused provider discovers a different issuer", async () => {
@@ -924,9 +1229,7 @@ describe("OAuthConnectionHandler", () => {
         const authorizationUrl = new URL(result.authorizationUrl);
 
         expect(authorizationUrl.searchParams.get("access_type")).toBeNull();
-        expect(authorizationUrl.searchParams.get("prompt")).toBe(
-          "select_account",
-        );
+        expect(authorizationUrl.searchParams.get("prompt")).toBeNull();
       });
 
       it("surfaces the auth() failure as the error message", async () => {
@@ -1116,7 +1419,7 @@ describe("settleClientIdentity", () => {
       getAuthorizationCode: () => null,
       getAuthorizationUrl: () => new URL("https://as.example/authorize"),
       getUserCode: () => null,
-      setDiscoveredScope: () => {},
+      setDiscoveredScopes: () => {},
       setExtraAuthorizationParams: () => {},
       redirectUrl: "https://mcpx.example/auth/callback",
       clientMetadata: { redirect_uris: ["https://mcpx.example/auth/callback"] },

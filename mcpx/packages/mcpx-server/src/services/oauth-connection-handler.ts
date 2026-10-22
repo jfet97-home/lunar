@@ -1,4 +1,4 @@
-import { makeError } from "@aigw/core/data";
+import { makeError, readProp } from "@aigw/core/data";
 import { loggableError } from "@aigw/core/logging";
 import { withTimeout } from "@aigw/core/time";
 import {
@@ -13,17 +13,26 @@ import { SSEClientTransport } from "@modelcontextprotocol/sdk/client/sse.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { createUpstreamHttpTransport } from "./streamable-http-reconnection.js";
 import { Logger } from "winston";
+import { z } from "zod/v4";
 import {
   SSETargetServer,
   StreamableHttpTargetServer,
 } from "../model/target-servers.js";
 import {
   ExtraAuthorizationParams,
+  SELECT_ACCOUNT_PROMPT,
+  CONSENT_PROMPT,
   McpxOAuthProviderI,
+  Prompt,
 } from "../oauth-providers/model.js";
 import { DEVICE_FLOW_COMPLETE } from "../oauth-providers/device-flow.js";
 import { OAuthSessionManagerI } from "../server/oauth-session-manager.js";
-import { ExtendedClientBuilderI, ExtendedClientI } from "./client-extension.js";
+import { TokenStoreUnavailableError } from "./oauth-token-store.js";
+import {
+  ExtendedClientBuilderI,
+  ExtendedClientI,
+  isRateLimitError,
+} from "./client-extension.js";
 import { buildClient } from "./target-server-connection-factory.js";
 import { RefreshCoalescer } from "./refresh-coalescing-fetch.js";
 import {
@@ -42,6 +51,9 @@ const DEVICE_FLOW_TIMEOUT_MS = 15 * 60 * 1000;
 const DEVICE_FLOW_MAX_POLL_ATTEMPTS = Math.ceil(
   DEVICE_FLOW_TIMEOUT_MS / OAUTH_POLLING_INTERVAL_MS,
 );
+const promptMetadataSchema = z.object({
+  prompt_values_supported: z.array(z.string()).optional(),
+});
 
 type RemoteTargetServer = SSETargetServer | StreamableHttpTargetServer;
 type RemoteTransport = SSEClientTransport | StreamableHTTPClientTransport;
@@ -121,13 +133,30 @@ export interface InitiateOAuthResult {
  *  - connected:   stored tokens worked; use this client.
  *  - needs-auth:  OAuth server, no/expired tokens → start a flow.
  *  - unreachable: OAuth server, valid tokens, no response → retry.
+ *  - rate-limited: OAuth server, valid tokens, upstream answered 429.
+ *  - token-store-unavailable: auth state unknown until the store recovers.
  *  - not-oauth:   not an OAuth server → a flow can't help.
  */
 export type ExistingAuthVerdict =
   | { kind: "connected"; client: ExtendedClientI }
   | { kind: "needs-auth" }
   | { kind: "unreachable" }
+  | { kind: "rate-limited" }
+  | { kind: "token-store-unavailable"; error: TokenStoreUnavailableError }
   | { kind: "not-oauth" };
+
+/**
+ * Outcome of connecting with stored tokens.
+ *  - connected:    stored tokens worked; use this client.
+ *  - rate-limited: upstream answered 429; tokens kept.
+ *  - token-store-unavailable: stored tokens may exist but cannot be read.
+ *  - failed:       no stored tokens, or they did not connect.
+ */
+export type ExistingTokensResult =
+  | { kind: "connected"; client: ExtendedClientI }
+  | { kind: "rate-limited" }
+  | { kind: "token-store-unavailable"; error: TokenStoreUnavailableError }
+  | { kind: "failed" };
 
 type ProtectedResourceMeta = Awaited<
   ReturnType<typeof discoverOAuthProtectedResourceMetadata>
@@ -255,7 +284,7 @@ export class OAuthConnectionHandler {
     });
   }
 
-  // Returns the connected client on success, undefined otherwise.
+  // Returns the connected client on success, or why it could not connect.
   // No-op for servers with no in-session provider and no persisted tokens, so
   // callers can use isOAuthServer afterward to tell "never authed" from
   // "tokens expired". Rehydrates the provider on restart when disk has tokens.
@@ -263,7 +292,7 @@ export class OAuthConnectionHandler {
   // for the watchdog to retry.
   async safeTryWithExistingTokens(
     targetServer: RemoteTargetServer,
-  ): Promise<ExtendedClientI | undefined> {
+  ): Promise<ExistingTokensResult> {
     const version = this.flowVersions.get(targetServer.name) ?? 0;
     const isCurrent = (): boolean =>
       version === (this.flowVersions.get(targetServer.name) ?? 0);
@@ -274,21 +303,25 @@ export class OAuthConnectionHandler {
       targetServer.name,
     );
     if (!authProvider) {
-      let hasPersisted: boolean;
       try {
-        hasPersisted = await this.oauthSessionManager.hasPersistedOAuthTokens(
-          targetServer.name,
-        );
+        if (
+          !(await this.oauthSessionManager.hasPersistedOAuthTokens(
+            targetServer.name,
+          ))
+        ) {
+          return { kind: "failed" };
+        }
       } catch (error) {
-        this.logger.info(
-          "Could not check persisted tokens, preserving for retry",
-          { name: targetServer.name, error: loggableError(error) },
-        );
-        return undefined;
+        if (error instanceof TokenStoreUnavailableError) {
+          return { kind: "token-store-unavailable", error };
+        }
+        this.logger.warn("Could not read persisted tokens, treating as none", {
+          name: targetServer.name,
+          error: loggableError(error),
+        });
+        return { kind: "failed" };
       }
-      if (!hasPersisted || !isCurrent()) {
-        return undefined;
-      }
+      if (!isCurrent()) return { kind: "failed" };
       authProvider = this.oauthSessionManager.getOrCreateOAuthProvider({
         serverName: targetServer.name,
         serverUrl: targetServer.url,
@@ -301,14 +334,17 @@ export class OAuthConnectionHandler {
     try {
       existingTokens = await authProvider.tokens();
     } catch (error) {
+      if (error instanceof TokenStoreUnavailableError) {
+        return { kind: "token-store-unavailable", error };
+      }
       this.logger.warn("Failed to read tokens", {
         name: targetServer.name,
         error: loggableError(error),
       });
-      return undefined;
+      return { kind: "failed" };
     }
     if (!existingTokens || !isCurrent()) {
-      return undefined;
+      return { kind: "failed" };
     }
     this.logger.info("Found existing tokens, attempting to use them", {
       name: targetServer.name,
@@ -329,7 +365,7 @@ export class OAuthConnectionHandler {
       });
       if (!isCurrent()) {
         await extendedClient.close();
-        return undefined;
+        return { kind: "failed" };
       }
 
       this.logger.info(
@@ -339,9 +375,12 @@ export class OAuthConnectionHandler {
           url: targetServer.url,
         },
       );
-      return extendedClient;
+      return { kind: "connected", client: extendedClient };
     } catch (error) {
-      if (!isCurrent()) return undefined;
+      if (!isCurrent()) return { kind: "failed" };
+      if (error instanceof TokenStoreUnavailableError) {
+        return { kind: "token-store-unavailable", error };
+      }
       if (isAuthenticationError(error) || isInvalidGrantError(error)) {
         // Tokens permanently rejected (401 or invalid_grant on refresh).
         // Delete them so resolveExistingAuth routes to pending-auth (re-auth)
@@ -351,6 +390,12 @@ export class OAuthConnectionHandler {
           { name: targetServer.name, error: loggableError(error) },
         );
         await this.deleteOAuthTokensForServer(targetServer.name);
+      } else if (isRateLimitError(error)) {
+        this.logger.info("Server rate limited existing tokens, preserving", {
+          name: targetServer.name,
+          error: loggableError(error),
+        });
+        return { kind: "rate-limited" };
       } else {
         // Network / transport error — tokens may still be valid once the server is back.
         this.logger.info(
@@ -361,7 +406,7 @@ export class OAuthConnectionHandler {
           },
         );
       }
-      return undefined;
+      return { kind: "failed" };
     }
   }
 
@@ -394,7 +439,10 @@ export class OAuthConnectionHandler {
       if (version !== (this.flowVersions.get(targetServer.name) ?? 0)) {
         throw new Error("OAuth flow was cancelled. Sign in again.");
       }
-      if (result && this.oauthSessionManager.getOAuthFlow(result.state)) {
+      const activeFlow = result
+        ? this.oauthSessionManager.getOAuthFlow(result.state)
+        : undefined;
+      if (result && activeFlow) {
         this.logger.debug("Reusing existing OAuth flow", {
           name: targetServer.name,
         });
@@ -474,7 +522,7 @@ export class OAuthConnectionHandler {
 
     // Apply metadata-driven scope and authorization request defaults before the
     // SDK builds the browser authorization URL.
-    const authMeta = await this.applyDiscoveredScope(
+    const authMeta = await this.applyDiscoveredScopes(
       targetServer.url,
       authProvider,
     );
@@ -689,28 +737,35 @@ export class OAuthConnectionHandler {
   }
 
   /**
-   * Applies metadata-driven authorization settings. `offline_access` is the
-   * OpenID Connect scope used by servers that advertise it; Google instead
+   * Applies metadata-driven authorization settings. Request `openid` alongside
+   * `offline_access` when both are advertised; Google additionally
    * requires `access_type=offline` and interactive consent.
    * Discovery remains non-fatal and the flow continues without defaults.
    */
-  private async applyDiscoveredScope(
+  private async applyDiscoveredScopes(
     serverUrl: string,
     provider: McpxOAuthProviderI,
   ): Promise<AuthorizationServerMeta | undefined> {
     const { authMeta } = await this.discoverOAuthMetadata(serverUrl);
     if (authMeta?.scopes_supported?.includes("offline_access")) {
-      provider.setDiscoveredScope("offline_access");
-      this.logger.debug("Requested offline_access scope", {
+      const scopes = authMeta.scopes_supported.includes("openid")
+        ? ["openid", "offline_access"]
+        : ["offline_access"];
+      provider.setDiscoveredScopes(scopes);
+      this.logger.debug("Requested discovered OAuth scopes", {
         serverUrl,
         provider: provider.serverName,
+        scopes,
       });
     }
 
     const extraParams: ExtraAuthorizationParams = {};
+    // The SDK strips prompt_values_supported from OIDC-only discovery metadata.
+    const promptMetadata = promptMetadataSchema.safeParse(authMeta);
+    const prompts: Prompt[] = [];
     if (authMeta?.issuer === "https://accounts.google.com") {
       extraParams.access_type = "offline";
-      extraParams.prompt = "consent";
+      prompts.push(CONSENT_PROMPT);
       this.logger.debug(
         "Requested access_type=offline and prompt=consent for Google authorization",
         {
@@ -719,6 +774,22 @@ export class OAuthConnectionHandler {
         },
       );
     }
+    if (
+      promptMetadata.success &&
+      promptMetadata.data.prompt_values_supported?.includes(CONSENT_PROMPT)
+    ) {
+      extraParams.consentSupported = true;
+    }
+    // Missing or malformed metadata does not establish account-selection support.
+    if (
+      promptMetadata.success &&
+      promptMetadata.data.prompt_values_supported?.includes(
+        SELECT_ACCOUNT_PROMPT,
+      )
+    ) {
+      prompts.push(SELECT_ACCOUNT_PROMPT);
+    }
+    if (prompts.length > 0) extraParams.prompt = prompts;
     provider.setExtraAuthorizationParams(extraParams);
 
     return authMeta;
@@ -878,10 +949,10 @@ export class OAuthConnectionHandler {
   async resolveExistingAuth(
     targetServer: RemoteTargetServer,
   ): Promise<ExistingAuthVerdict> {
-    const client = await this.safeTryWithExistingTokens(targetServer);
-    if (client) {
-      return { kind: "connected", client };
-    }
+    const existing = await this.safeTryWithExistingTokens(targetServer);
+    // Connected, rate-limited and an unavailable store are verdicts already;
+    // only a failed token attempt needs further OAuth classification.
+    if (existing.kind !== "failed") return existing;
 
     // OAuth server if we have a context or it advertises metadata. Probe is a
     // network call, so skip it when we already have context (short-circuit).
@@ -951,12 +1022,4 @@ export function isAuthenticationError(error: unknown): boolean {
     (typeof message === "string" &&
       (message.includes("401") || message.includes("Unauthorized")))
   );
-}
-
-// `message` and `name` live on Error's prototype chain, so a spread or
-// Object.entries copy would miss them.
-function readProp(value: unknown, key: string): unknown {
-  return typeof value === "object" && value !== null
-    ? Reflect.get(value, key)
-    : undefined;
 }

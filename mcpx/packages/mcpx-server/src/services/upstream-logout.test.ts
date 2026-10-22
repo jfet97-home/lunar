@@ -632,7 +632,10 @@ describe("upstream recovery and OAuth logout", () => {
       );
       const authRecovery = jest
         .spyOn(harness.oauth, "safeTryWithExistingTokens")
-        .mockResolvedValue(harness.extended as unknown as ExtendedClientI);
+        .mockResolvedValue({
+          kind: "connected",
+          client: harness.extended as unknown as ExtendedClientI,
+        });
       await expect(
         harness.upstream.callTool("docs", { name: "read" }),
       ).resolves.toEqual({ content: [] });
@@ -891,7 +894,10 @@ describe("upstream recovery and OAuth logout", () => {
       );
       jest
         .spyOn(harness.oauth, "safeTryWithExistingTokens")
-        .mockResolvedValue(harness.extended as unknown as ExtendedClientI);
+        .mockResolvedValue({
+          kind: "connected",
+          client: harness.extended as unknown as ExtendedClientI,
+        });
       await expect(
         harness.upstream.callTool("docs", { name: "read" }),
       ).rejects.toThrow();
