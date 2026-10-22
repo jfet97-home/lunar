@@ -1,4 +1,4 @@
-import { indexBy, makeError } from "@aigw/core/data";
+import { indexBy, makeError, readProp } from "@aigw/core/data";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import {
   ErrorCode,
@@ -67,13 +67,22 @@ export type OriginalClientI = Pick<
 // "invalid-response-format":
 // Some servers (e.g. LaunchDarkly-remote) return HTTP 200 to a ping but with a invalid JSON-RPC body.
 // The server is reachable, so treat as alive but stop pinging it.
-type PingUnsupportedReason = "method-not-found" | "invalid-response-format";
+
+// "rate-limited":
+// HTTP 429 means the server is alive but throttling us. Every ping spends from
+// the same quota as real calls and a failed one feeds the failure counter, so stop pinging it.
+type PingUnsupportedReason =
+  | "method-not-found"
+  | "invalid-response-format"
+  | "rate-limited";
 
 const PING_UNSUPPORTED_MESSAGES: Record<PingUnsupportedReason, string> = {
   "method-not-found":
     "Server does not implement ping — treating as alive, will not ping again",
   "invalid-response-format":
     "Server returned a malformed ping response — treating as alive, will not ping again",
+  "rate-limited":
+    "Server rate limit exceeded — treating as alive, will not ping again",
 };
 export interface ExtendedClientBuilderI {
   build(props: {
@@ -107,7 +116,7 @@ export class ExtendedClientBuilder {
     private logger: Logger,
   ) {}
 
-  // TODO MCP-59: add test for caching?
+  // TODO(MCP-59): add a test for caching
   async build(props: {
     name: string;
     originalClient: OriginalClientI;
@@ -201,6 +210,7 @@ export class ExtendedClientBuilder {
 export function isTransportError(e: unknown): boolean {
   return (
     e instanceof Error &&
+    !isRateLimitError(e) &&
     (!(e instanceof McpError) ||
       e.code === ErrorCode.RequestTimeout ||
       e.code === ErrorCode.ConnectionClosed)
@@ -209,6 +219,11 @@ export function isTransportError(e: unknown): boolean {
 
 export function isRequestTimeoutError(e: unknown): boolean {
   return e instanceof McpError && e.code === ErrorCode.RequestTimeout;
+}
+
+// HTTP 429 is a response, so it does not count against liveness
+export function isRateLimitError(e: unknown): boolean {
+  return readProp(e, "code") === 429;
 }
 
 export function isMethodNotFoundError(e: unknown): boolean {
@@ -361,6 +376,7 @@ export class ExtendedClient {
       return { result: true, reason: "method-not-found" };
     if (isInvalidResponseFormatError(e))
       return { result: true, reason: "invalid-response-format" };
+    if (isRateLimitError(e)) return { result: true, reason: "rate-limited" };
     return { result: false };
   }
 }
@@ -445,10 +461,10 @@ class ExtendedTool {
     }
     switch (this.extension.description.action) {
       case "append":
-        return ExtendedTool.appendSentence(
-          this.original.description,
-          this.extension.description.text,
-        );
+        return ExtendedTool.appendSentence({
+          original: this.original.description,
+          extra: this.extension.description.text,
+        });
       case "rewrite":
         return this.extension.description.text;
     }
@@ -463,10 +479,10 @@ class ExtendedTool {
     }
     switch (description.action) {
       case "append":
-        return ExtendedTool.appendSentence(
-          originalDescription || "",
-          description.text,
-        );
+        return ExtendedTool.appendSentence({
+          original: originalDescription || "",
+          extra: description.text,
+        });
       case "rewrite":
         return description.text;
     }
@@ -521,7 +537,11 @@ class ExtendedTool {
     return { ...rawOriginalProperty, description };
   }
 
-  private static appendSentence(original: string, extra: string): string {
+  private static appendSentence(props: {
+    original: string;
+    extra: string;
+  }): string {
+    const { original, extra } = props;
     if (original.trim() === "") {
       return extra;
     }

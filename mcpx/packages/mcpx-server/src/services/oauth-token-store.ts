@@ -7,11 +7,23 @@ import z from "zod/v4";
 
 export type StoredTokens = OAuthTokens & { expires_at?: number };
 
+// The store could not be reached, so it gave no answer (e.g. the Hub socket is
+// away). Callers may try again. Any other error is an answer from the store.
+export class TokenStoreUnavailableError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "TokenStoreUnavailableError";
+  }
+}
+
 export interface OAuthTokenStoreI {
   loadTokens(serverName: string): Promise<StoredTokens | undefined>;
   saveTokens(serverName: string, data: StoredTokens): Promise<void>;
   loadCodeVerifier(serverName: string): Promise<string | undefined>;
-  saveCodeVerifier(serverName: string, verifier: string): Promise<void>;
+  saveCodeVerifier(props: {
+    serverName: string;
+    verifier: string;
+  }): Promise<void>;
   loadClientInfo(
     serverName: string,
   ): Promise<OAuthClientInformationFull | undefined>;

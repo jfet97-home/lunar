@@ -2,7 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   GetIdentityResponse,
   Identity,
-  UI_ClientBoundMessage,
+  UiClientBoundMessage,
 } from "@mcpx/shared-model";
 import { apiClient } from "@/lib/api";
 import { useEffect } from "react";
@@ -32,9 +32,9 @@ export function useIdentityLiveSync(): void {
     const handler = (payload: GetIdentityResponse): void => {
       queryClient.setQueryData(IDENTITY_QUERY_KEY, payload);
     };
-    socket.on(UI_ClientBoundMessage.IdentityChanged, handler);
+    socket.on(UiClientBoundMessage.IdentityChanged, handler);
     return () => {
-      socket.off(UI_ClientBoundMessage.IdentityChanged, handler);
+      socket.off(UiClientBoundMessage.IdentityChanged, handler);
     };
   }, [socket, queryClient]);
 }
@@ -94,6 +94,19 @@ export function getSpaceKindLabel(identity: Identity): string {
     default:
       return "space";
   }
+}
+
+type SpaceEntity = Extract<
+  Extract<Identity, { mode: "enterprise" }>["entity"],
+  { entityType: "space" }
+>;
+export type SpaceKind = NonNullable<SpaceEntity["spaceKind"]>;
+
+export function getSpaceKind(identity: Identity): SpaceKind | undefined {
+  if (identity.mode === "personal" || identity.entity.entityType !== "space") {
+    return undefined;
+  }
+  return identity.entity.spaceKind;
 }
 
 export function getSpaceName(identity: Identity): string | undefined {

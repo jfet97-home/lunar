@@ -171,7 +171,11 @@ export class InternalCapabilitiesService {
   ): Tool | undefined {
     const handler = this.toolHandlers.get(cap.capabilityName);
     if (!handler) {
-      this.logDriftMiss("tools", cap.serverName, cap.capabilityName);
+      this.logDriftMiss({
+        kind: "tools",
+        serverName: cap.serverName,
+        capabilityName: cap.capabilityName,
+      });
       return undefined;
     }
     if (!handler.isVisible(consumer, cap)) return undefined;
@@ -202,7 +206,11 @@ export class InternalCapabilitiesService {
   ): Resource | undefined {
     const handler = this.resourceHandlers.get(cap.serverName);
     if (!handler) {
-      this.logDriftMiss("resources", cap.serverName, cap.capabilityName);
+      this.logDriftMiss({
+        kind: "resources",
+        serverName: cap.serverName,
+        capabilityName: cap.capabilityName,
+      });
       return undefined;
     }
     if (!handler.isVisible(consumer, cap)) return undefined;
@@ -215,7 +223,11 @@ export class InternalCapabilitiesService {
   ): Prompt | undefined {
     const handler = this.promptHandlers.get(cap.serverName);
     if (!handler) {
-      this.logDriftMiss("prompts", cap.serverName, cap.capabilityName);
+      this.logDriftMiss({
+        kind: "prompts",
+        serverName: cap.serverName,
+        capabilityName: cap.capabilityName,
+      });
       return undefined;
     }
     if (!handler.isVisible(consumer, cap)) return undefined;
@@ -252,11 +264,12 @@ export class InternalCapabilitiesService {
     return handler.getPrompt(entry.capabilityName);
   }
 
-  private logDriftMiss(
-    kind: CapabilityKind,
-    serverName: string,
-    capabilityName: string,
-  ): void {
+  private logDriftMiss(props: {
+    kind: CapabilityKind;
+    serverName: string;
+    capabilityName: string;
+  }): void {
+    const { kind, serverName, capabilityName } = props;
     this.logger.warn(
       `Internal ${kind} registered without a handler — hidden from listing`,
       { serverName, capabilityName },

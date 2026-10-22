@@ -14,11 +14,6 @@ import { UpstreamSessionExpiredError } from "./streamable-http-reconnection.js";
 //     instead of reading env inline.
 import { makeError, stringifyEq } from "@aigw/core/data";
 import { loggableError, TelemetryLogger } from "@aigw/core/logging";
-import {
-  Prompt,
-  PromptMessage,
-  Tool,
-} from "@modelcontextprotocol/sdk/types.js";
 
 import { ConfigService } from "../config.js";
 import { env } from "../env.js";
@@ -34,7 +29,6 @@ import {
   AlreadyExistsError,
   FailedToConnectToTargetServer,
   InvalidSchemaError,
-  isPendingInputError,
   NotAllowedError,
   NotFoundError,
   TokenExpiredError,
@@ -50,7 +44,6 @@ import {
 import {
   fetchPromptCapabilities,
   fetchPromptMessages,
-  fetchServerCapabilities,
   fetchToolCapabilities,
 } from "./fetch-capabilities.js";
 import { sanitizeTargetServerForTelemetry } from "./control-plane-service.js";
@@ -70,14 +63,22 @@ import {
   buildSystemStatePromptsPayload,
   buildSystemStateToolsPayload,
   prepareForSystemState,
+  PrepareForSystemStateProps,
 } from "./prepare-for-system-state.js";
 import {
   TargetClient,
   ConnectedTargetClient,
+  ConnectingTargetClient,
   PendingAuthTargetClient,
   isConnected,
   isConnectionFailed,
+  isConnecting,
+  isPendingAuth,
 } from "./target-client-types.js";
+import {
+  TargetClientConnector,
+  TargetClientUpsert,
+} from "./target-client-connector.js";
 import { UpstreamWatchdog } from "./upstream-watchdog.js";
 
 export interface UpstreamHandlerConfig {
@@ -98,16 +99,17 @@ export interface TargetServerChangeNotifier {
 }
 
 export interface UpstreamHandlerOAuthHandler {
-  initiateOAuthForServer(
-    targetServerName: string,
-    callbackUrl?: string,
-  ): Promise<InitiateOAuthResult>;
-  completeOAuthByState(state: string, code: string): Promise<void>;
+  initiateOAuthForServer(props: {
+    targetServerName: string;
+    callbackUrl?: string;
+  }): Promise<InitiateOAuthResult>;
 }
 
 function sameStringSet(a: Set<string>, b: Set<string>): boolean {
   return a.size === b.size && [...a].every((x) => b.has(x));
 }
+
+export type CompleteOAuthOutcome = "completed" | "unknown-state";
 
 type RemoteConnectedTargetClient = ConnectedTargetClient & {
   targetServer: RemoteTargetServer;
@@ -120,6 +122,16 @@ function hasRemoteTargetServer(
     client.targetServer.type === "sse" ||
     client.targetServer.type === "streamable-http"
   );
+}
+
+// Capabilities live in CapabilityRegistry, so the stored client drops them.
+function storedClient(upsert: TargetClientUpsert): TargetClient {
+  if (!isConnected(upsert)) return upsert;
+  return {
+    _state: "connected",
+    targetServer: upsert.targetServer,
+    extendedClient: upsert.extendedClient,
+  };
 }
 
 // This class manages connections to upstream MCP servers, via initializing
@@ -151,7 +163,11 @@ export class UpstreamHandler
     resources: new Map(), // unused: resources are currently local, not upstream
   };
   private _watchdog: UpstreamWatchdog;
+  // Connection attempts run here and cannot record state, so the stale check
+  // in attemptReconnect covers every outcome.
+  private readonly connector: TargetClientConnector;
   private readonly reconnectQueue = new Map<string, NodeJS.Timeout>();
+  private readonly reconnectsInFlight = new Map<string, Promise<void>>();
   private readonly reconnectAttemptsByServer = new Map<string, number>();
   private readonly reconnectBaseDelayMs: number;
   private readonly sessionProbeTimeoutMs: number;
@@ -171,7 +187,7 @@ export class UpstreamHandler
   constructor(
     private systemState: SystemStateTracker,
     private serverConfigManager: ServerConfigManager,
-    private connectionFactory: TargetServerConnectionFactory,
+    connectionFactory: TargetServerConnectionFactory,
     private oauthConnectionHandler: OAuthConnectionHandler,
     private catalogManager: CatalogManagerI,
     private toolTokenEstimator: ToolTokenEstimator,
@@ -184,6 +200,15 @@ export class UpstreamHandler
     this.logger = logger.child({ component: "UpstreamHandler" });
     this.reconnectBaseDelayMs = config.reconnectBaseDelayMs;
     this.sessionProbeTimeoutMs = config.pingTimeoutMs;
+    this.connector = new TargetClientConnector(
+      connectionFactory,
+      oauthConnectionHandler,
+      catalogManager,
+      (serverName) =>
+        this.reconnectAttemptsByServer.get(normalizeServerName(serverName)) ??
+        0,
+      this.logger,
+    );
     this._watchdog = new UpstreamWatchdog(
       {
         pingServer: (name): Promise<PingOutcome> =>
@@ -337,14 +362,15 @@ export class UpstreamHandler
       const next = config.toolExtensions.services;
       const prev = this.previousToolExtensions;
       this.previousToolExtensions = next;
-      this.onToolExtensionsChanged(prev, next);
+      this.onToolExtensionsChanged({ prev, next });
     });
   }
 
-  private onToolExtensionsChanged(
-    prev: ToolExtensions["services"],
-    next: ToolExtensions["services"],
-  ): void {
+  private onToolExtensionsChanged(props: {
+    prev: ToolExtensions["services"];
+    next: ToolExtensions["services"];
+  }): void {
+    const { prev, next } = props;
     const allNames = new Set([...Object.keys(prev), ...Object.keys(next)]);
     for (const name of allNames) {
       if (stringifyEq(prev[name], next[name])) continue;
@@ -407,9 +433,12 @@ export class UpstreamHandler
         .map((t) => t.definition);
       this.systemState.updateTargetServerTools({
         name: client.targetServer.name,
-        ...buildSystemStateToolsPayload(approvedTools, rawTools, (tool) =>
-          this.toolTokenEstimator.estimateTokens(tool),
-        ),
+        ...buildSystemStateToolsPayload({
+          approvedTools,
+          rawTools,
+          estimateTokens: (tool) =>
+            this.toolTokenEstimator.estimateTokens(tool),
+        }),
       });
 
       const approvedPrompts =
@@ -419,11 +448,11 @@ export class UpstreamHandler
         .map((p) => p.definition);
       this.systemState.updateTargetServerPrompts({
         name: client.targetServer.name,
-        ...buildSystemStatePromptsPayload(
+        ...buildSystemStatePromptsPayload({
           approvedPrompts,
           rawPrompts,
-          entry.promptMessages,
-        ),
+          promptMessages: entry.promptMessages,
+        }),
       });
     }
   }
@@ -523,25 +552,30 @@ export class UpstreamHandler
     serviceName: string,
     params: Parameters<ExtendedClientI["callTool"]>[0],
   ): ReturnType<ExtendedClientI["callTool"]> {
-    return this.proxyToUpstream(serviceName, "callTool", (extended) =>
-      extended.callTool(params),
-    );
+    return this.proxyToUpstream({
+      serviceName,
+      method: "callTool",
+      action: (extended) => extended.callTool(params),
+    });
   }
 
   async getPrompt(
     serviceName: string,
     params: Parameters<ExtendedClientI["getPrompt"]>[0],
   ): ReturnType<ExtendedClientI["getPrompt"]> {
-    return this.proxyToUpstream(serviceName, "getPrompt", (extended) =>
-      extended.getPrompt(params),
-    );
+    return this.proxyToUpstream({
+      serviceName,
+      method: "getPrompt",
+      action: (extended) => extended.getPrompt(params),
+    });
   }
 
-  private proxyToUpstream<T>(
-    serviceName: string,
-    method: string,
-    action: (extended: ExtendedClientI) => Promise<T>,
-  ): Promise<T> {
+  private proxyToUpstream<T>(props: {
+    serviceName: string;
+    method: string;
+    action: (extended: ExtendedClientI) => Promise<T>;
+  }): Promise<T> {
+    const { serviceName, method, action } = props;
     const client = this.requireConnectedClient(serviceName);
     return this.executeWithAuthRetry(client, method, (extended) => {
       this.assertAuthTargetCurrent(client.targetServer);
@@ -641,7 +675,8 @@ export class UpstreamHandler
       normalizeServerName(serviceName),
     );
     if (
-      pendingClient?._state === "pending-auth" &&
+      pendingClient &&
+      isPendingAuth(pendingClient) &&
       this.isOAuthServer(serviceName)
     ) {
       throw new TokenExpiredError(serviceName);
@@ -664,7 +699,7 @@ export class UpstreamHandler
     this.targetServers = updatedServers;
     client.targetServer = { ...client.targetServer, description };
     this.assertAuthTargetCurrent(client.targetServer);
-    const state = this.prepareForSystemState(client);
+    const state = this.prepareForSystemState({ targetClient: client });
     this.systemState.updateTargetServerDescription({
       name: normalizedName,
       description: state.description,
@@ -767,7 +802,7 @@ export class UpstreamHandler
     // Immediately record "connecting" state so UI sees the server right away
     await this.recordClientUpsert({ _state: "connecting", targetServer });
 
-    const client = await this.safeInitiateClient(targetServer);
+    const client = await this.connector.connect(targetServer);
     this.serverConfigManager.writeTargetServers(this.targetServers);
     await this.recordClientUpsert(client);
     this.logger.info("Client added", { name: targetServer.name });
@@ -803,7 +838,7 @@ export class UpstreamHandler
     // Now attempt actual connections
     await Promise.all(
       this.targetServers.map(async (server) => {
-        const client = await this.safeInitiateClient(server);
+        const client = await this.connector.connect(server);
         if (!client) return;
         await this.recordClientUpsert(client);
       }),
@@ -871,10 +906,11 @@ export class UpstreamHandler
    * state (pending-auth for first-time auth, or connected for proactive re-auth).
    * For device flows, auto-completion registers the client when the user authorizes.
    */
-  async initiateOAuthForServer(
-    targetServerName: string,
-    callbackUrl?: string,
-  ): Promise<InitiateOAuthResult> {
+  async initiateOAuthForServer(props: {
+    targetServerName: string;
+    callbackUrl?: string;
+  }): Promise<InitiateOAuthResult> {
+    const { targetServerName, callbackUrl } = props;
     const normalizedName = normalizeServerName(targetServerName);
     await this.logoutOperations.get(normalizedName);
     const client = this._clientsByService.get(normalizedName);
@@ -895,7 +931,7 @@ export class UpstreamHandler
       extendedClient: ExtendedClientI,
     ): Promise<void> => {
       await this.recordClientUpsert(
-        await this.finalizeConnection(targetServer, extendedClient),
+        await this.connector.finalize(targetServer, extendedClient),
       );
     };
     // initiateOAuth dedupes per server, so repeat or concurrent calls reuse the
@@ -903,7 +939,7 @@ export class UpstreamHandler
     return this.oauthConnectionHandler.initiateOAuth(targetServer, {
       callbackUrl,
       onComplete,
-      resetStaleTokens: client._state === "pending-auth",
+      resetStaleTokens: isPendingAuth(client),
     });
   }
 
@@ -916,29 +952,35 @@ export class UpstreamHandler
   }
 
   /**
-   * Phase 2: Complete OAuth flow for a pending-auth server with authorization code.
-   * Transitions server from pending-auth to connected (or connection-failed on error).
-   * Complete OAuth flow using the OAuth state parameter.
-   * This is the main entry point for OAuth callbacks - handles state lookup,
-   * connection completion, and cleanup in one call.
+   * Completes an OAuth flow for the given state. Returns "unknown-state" when
+   * no active flow exists; failures during a known flow still throw.
    */
-  async completeOAuthByState(state: string, code: string): Promise<void> {
+  async completeOAuthByState(props: {
+    state: string;
+    code: string;
+  }): Promise<CompleteOAuthOutcome> {
+    const { state, code } = props;
     const serverName = this.oauthConnectionHandler.getServerNameByState(state);
     if (!serverName) {
-      throw new NotFoundError(`No OAuth flow found for state: ${state}`);
+      return "unknown-state";
     }
 
     try {
-      await this.completeOAuthForServer(serverName, code);
+      await this.completeOAuthForServer({
+        targetServerName: serverName,
+        authorizationCode: code,
+      });
+      return "completed";
     } finally {
       this.oauthConnectionHandler.completeOAuthFlowCleanup(state);
     }
   }
 
-  private async completeOAuthForServer(
-    targetServerName: string,
-    authorizationCode: string,
-  ): Promise<void> {
+  private async completeOAuthForServer(props: {
+    targetServerName: string;
+    authorizationCode: string;
+  }): Promise<void> {
+    const { targetServerName, authorizationCode } = props;
     const client = this._clientsByService.get(
       normalizeServerName(targetServerName),
     );
@@ -954,25 +996,30 @@ export class UpstreamHandler
     }
 
     try {
-      const extendedClient = await this.oauthConnectionHandler.completeOAuth(
-        targetServerName,
+      const extendedClient = await this.oauthConnectionHandler.completeOAuth({
+        serverName: targetServerName,
         authorizationCode,
-      );
+      });
 
       this.logger.info("OAuth connection established", { targetServerName });
 
-      const newTargetClient = await this.finalizeConnection(
+      const newTargetClient = await this.connector.finalize(
         targetServer,
         extendedClient,
       );
       await this.recordClientUpsert(newTargetClient);
     } catch (e) {
+      // A failed sign-in says nothing about the stored tokens, so the server
+      // keeps its state. The flow cleared them only if it started from
+      // pending-auth, and then the server is still pending-auth. From any other
+      // state they may still work, and a queued reconnect still uses them.
       const error = makeError(e);
-      this.logger.error("Failed to complete OAuth, reverting to pending-auth", {
+      this.logger.error("Failed to complete OAuth, keeping the server state", {
         targetServerName,
+        state: this._clientsByService.get(normalizeServerName(targetServerName))
+          ?._state,
         error: loggableError(error),
       });
-      await this.transitionToPendingAuth(targetServer);
       throw error;
     }
   }
@@ -981,22 +1028,23 @@ export class UpstreamHandler
   private async reuseOAuth(
     pendingAuth: PendingAuthTargetClient,
   ): Promise<ExtendedClientI> {
-    const extendedClient =
-      await this.oauthConnectionHandler.safeTryWithExistingTokens(
-        pendingAuth.targetServer,
-      );
-    if (!extendedClient) {
+    const reuse = await this.oauthConnectionHandler.safeTryWithExistingTokens(
+      pendingAuth.targetServer,
+    );
+    if (reuse.kind !== "connected") {
       this.logger.info("Could not reuse possible OAuth tokens", {
         targetServerName: pendingAuth.targetServer.name,
+        reason: reuse.kind,
       });
       // TODO: Add a more specific error message here
       return Promise.reject(new FailedToConnectToTargetServer());
     }
+    const extendedClient = reuse.client;
     this.logger.info("OAuth connection established", {
       targetServerName: pendingAuth.targetServer.name,
     });
     // Update the clientsByService map - this will replace the pendingAuth entry
-    const newTargetClient = await this.finalizeConnection(
+    const newTargetClient = await this.connector.finalize(
       pendingAuth.targetServer,
       extendedClient,
     );
@@ -1006,13 +1054,15 @@ export class UpstreamHandler
 
   // A method to record state about new client or update existing client.
   // Will update both the internal map and the system state tracker.
+  // Returns the client as stored.
   private async recordClientUpsert(
-    newTargetClient: TargetClient,
-  ): Promise<void> {
+    upsert: TargetClientUpsert,
+  ): Promise<TargetClient> {
+    const newTargetClient = storedClient(upsert);
     if (this.isAuthTargetRevoked(newTargetClient.targetServer)) {
       if (isConnected(newTargetClient))
         await newTargetClient.extendedClient.close();
-      return;
+      this.assertAuthTargetCurrent(newTargetClient.targetServer);
     }
     const normalizedName = normalizeServerName(
       newTargetClient.targetServer.name,
@@ -1021,18 +1071,28 @@ export class UpstreamHandler
     this.dropListChangedSubscriptions(normalizedName);
 
     this._clientsByService.set(normalizedName, newTargetClient);
+    // Same synchronous step as the commit, so no tool call sees the tools of a
+    // client that isn't connected, and a result the caller discards (a stale
+    // reconnect) never reaches the registry.
+    if (isConnected(upsert)) {
+      this.capabilityRegistry.registerServer(
+        normalizedName,
+        upsert.capabilities,
+      );
+    }
 
     if (!isConnected(newTargetClient)) {
       this._watchdog.unwatch(normalizedName);
       this.cancelReconnect(normalizedName);
-      if (isConnectionFailed(newTargetClient)) {
+      if (isConnectionFailed(newTargetClient))
         this.enqueueReconnect(normalizedName);
-      }
     }
 
-    if (isConnected(newTargetClient)) {
+    if (isConnected(newTargetClient) || isPendingAuth(newTargetClient)) {
       this.cancelReconnect(newTargetClient.targetServer.name);
       this.reconnectAttemptsByServer.delete(normalizedName);
+    }
+    if (isConnected(newTargetClient)) {
       const serverName = newTargetClient.targetServer.name;
       const ec = newTargetClient.extendedClient;
       const unsubscribeSessionExpired = ec.onSessionExpired?.((error) => {
@@ -1065,9 +1125,8 @@ export class UpstreamHandler
         );
       }
       this._watchdog.watch(normalizedName);
-      // Registry already populated by finalizeConnection.
       void this.kickoffPromptMessagesFetch(serverName, newTargetClient);
-    } else if (newTargetClient._state === "pending-auth") {
+    } else if (isPendingAuth(newTargetClient)) {
       // Surface the auth tool so the agent can call it to complete OAuth even
       // before the upstream tools are reachable.
       this.capabilityRegistry.registerServer(normalizedName, {
@@ -1078,7 +1137,7 @@ export class UpstreamHandler
           },
         ],
       });
-    } else if (newTargetClient._state !== "connecting") {
+    } else if (!isConnecting(newTargetClient)) {
       this.capabilityRegistry.unregisterServer(normalizedName);
     }
 
@@ -1091,7 +1150,7 @@ export class UpstreamHandler
         );
 
     // Approvals are discarded for "connecting" state; skip the lookup.
-    const skipApprovals = newTargetClient._state === "connecting";
+    const skipApprovals = isConnecting(newTargetClient);
     const approvedTools = skipApprovals
       ? []
       : this.capabilityResolver.getApprovedToolsForServer(normalizedName);
@@ -1107,74 +1166,21 @@ export class UpstreamHandler
     const upstreamPrompts = (registryEntry?.prompts ?? [])
       .filter((p) => p.origin === "upstream")
       .map((p) => p.definition);
-    const systemStateTargetServer = this.prepareForSystemState(
-      newTargetClient,
+    const systemStateTargetServer = this.prepareForSystemState({
+      targetClient: newTargetClient,
       approvedTools,
-      upstreamTools,
+      originalTools: upstreamTools,
       approvedPrompts,
-      upstreamPrompts,
-      registryEntry?.promptMessages,
+      originalPrompts: upstreamPrompts,
+      promptMessages: registryEntry?.promptMessages,
       displayName,
-    );
+    });
     this.systemState.recordTargetServerConnection(systemStateTargetServer);
 
-    if (newTargetClient._state !== "connecting") {
+    if (!isConnecting(newTargetClient)) {
       this.notifyPostChangeHooks();
     }
-  }
-
-  // Registry write happens in the same step that produces the connected
-  // client, so capability-state and connection-state advance together. Safe
-  // only because callers await no I/O between this registry write and the
-  // recordClientUpsert that commits the connected client, so no tool call can
-  // interleave and see a listable-but-not-connected capability. Auth tool is
-  // registered separately on pending-auth — agents shouldn't see it while the
-  // upstream is working. Failure short-circuits to connection-failed; reconnect
-  // path picks it up.
-  private finalizeConnection(
-    targetServer: TargetServer,
-    extendedClient: ExtendedClientI,
-    isCurrent: () => boolean = () => true,
-  ): Promise<TargetClient> {
-    if (!isCurrent() || this.isAuthTargetRevoked(targetServer)) {
-      return extendedClient.close().then(() => {
-        this.assertAuthTargetCurrent(targetServer);
-        throw new Error("Upstream connection was superseded");
-      });
-    }
-    return fetchServerCapabilities(extendedClient, this.logger)
-      .then((capabilities): TargetClient => {
-        this.assertAuthTargetCurrent(targetServer);
-        if (!isCurrent()) throw new Error("Upstream connection was superseded");
-        this.capabilityRegistry.registerServer(
-          normalizeServerName(targetServer.name),
-          capabilities,
-        );
-        return { _state: "connected", targetServer, extendedClient };
-      })
-      .catch(async (e): Promise<TargetClient> => {
-        await extendedClient.close().catch((closeError) => {
-          this.logger.warn(
-            "Failed to close client after capability load failed",
-            {
-              name: targetServer.name,
-              error: loggableError(closeError),
-            },
-          );
-        });
-        if (!isCurrent() || this.isAuthTargetRevoked(targetServer)) {
-          throw e;
-        }
-        this.logger.warn("Failed to load capabilities on connect", {
-          name: targetServer.name,
-          error: loggableError(e),
-        });
-        return {
-          _state: "connection-failed",
-          targetServer,
-          error: makeError(e),
-        };
-      });
+    return newTargetClient;
   }
 
   // promptMessages isn't an ActiveCapability, so the resolver diff won't fire
@@ -1365,7 +1371,7 @@ export class UpstreamHandler
         });
       });
       if (!isCurrent()) return;
-      const recovered = await this.safeInitiateClient(targetServer, isCurrent);
+      const recovered = await this.connector.connect(targetServer, isCurrent);
       if (!isCurrent()) {
         if (isConnected(recovered)) await recovered.extendedClient.close();
         return;
@@ -1440,9 +1446,31 @@ export class UpstreamHandler
     });
     const timeout = setTimeout(() => {
       this.reconnectQueue.delete(normalizedName);
-      void this.runReconnect(name);
+      const run = this.runReconnect(name)
+        .catch((error) => {
+          this.logger.warn("Upstream server reconnect failed", {
+            name,
+            error: loggableError(error),
+          });
+        })
+        .finally(() => {
+          if (this.reconnectsInFlight.get(normalizedName) === run) {
+            this.reconnectsInFlight.delete(normalizedName);
+          }
+        });
+      this.reconnectsInFlight.set(normalizedName, run);
     }, delay);
     this.reconnectQueue.set(normalizedName, timeout);
+  }
+
+  // Read-only views of the reconnect loop, so a caller can tell "nothing more
+  // will happen" without waiting for a timer that should never fire.
+  isReconnectQueued(name: string): boolean {
+    return this.reconnectQueue.has(normalizeServerName(name));
+  }
+
+  async reconnectSettled(name: string): Promise<void> {
+    await this.reconnectsInFlight.get(normalizeServerName(name));
   }
 
   private cancelReconnect(name: string): void {
@@ -1516,11 +1544,26 @@ export class UpstreamHandler
     const { targetServer } = existing;
     this.logger.debug("Attempting upstream server reconnect", { name });
 
-    await this.recordClientUpsert({ _state: "connecting", targetServer });
+    const connecting: ConnectingTargetClient = {
+      _state: "connecting",
+      targetServer,
+    };
+    await this.recordClientUpsert(connecting);
 
-    const newClient = await this.safeInitiateClient(targetServer);
-    if (this.isAuthTargetRevoked(targetServer)) {
-      if (isConnected(newClient)) await newClient.extendedClient.close();
+    const newClient = await this.connector.connect(targetServer);
+    if (
+      this.shuttingDown ||
+      this.isAuthTargetRevoked(targetServer) ||
+      this._clientsByService.get(normalizedName) !== connecting
+    ) {
+      if (isConnected(newClient)) {
+        await newClient.extendedClient.close().catch((error) => {
+          this.logger.warn("Failed to close discarded reconnect client", {
+            name,
+            error: loggableError(error),
+          });
+        });
+      }
       return false;
     }
     await this.recordClientUpsert(newClient);
@@ -1530,8 +1573,8 @@ export class UpstreamHandler
       state: newClient._state,
     });
 
-    // Keep retrying until connected or server is removed.
-    return isConnectionFailed(newClient);
+    // A confirmed need for sign-in waits for user action.
+    return !isConnected(newClient) && !isPendingAuth(newClient);
   }
 
   private notifyPostChangeHooks(): void {
@@ -1561,7 +1604,7 @@ export class UpstreamHandler
       });
       return Promise.reject(new NotFoundError("Client not found"));
     }
-    if (client._state === "pending-auth") {
+    if (isPendingAuth(client)) {
       return client;
     }
     this.logger.info("Found client is not pendingAuth", {
@@ -1569,137 +1612,6 @@ export class UpstreamHandler
       type: client._state,
     });
     return Promise.reject(new NotFoundError("Client is not pendingAuth"));
-  }
-
-  private hasStaticOauthConfigured(targetServer: RemoteTargetServer): boolean {
-    if (
-      targetServer.catalogItemId &&
-      this.oauthConnectionHandler.hasCatalogItemOAuth(
-        targetServer.catalogItemId,
-      )
-    ) {
-      return true;
-    }
-    return this.oauthConnectionHandler.hasStaticOAuthForUrl(targetServer.url);
-  }
-
-  // A method to safely initiate a client connection.
-  // Should always return a resolved Promise.
-  private async safeInitiateClient(
-    targetServer: TargetServer,
-    isCurrent: () => boolean = () => true,
-  ): Promise<TargetClient> {
-    // Error might be a connection error, either on an initial connection
-    // or when retrying with OAuth.
-    // We handle it once, in the end of the method, and return undefined if that happens.
-    let error: Error | undefined;
-
-    const catalogServer = targetServer.catalogItemId
-      ? this.catalogManager.getById(targetServer.catalogItemId)
-      : null;
-
-    if (targetServer.catalogItemId && !catalogServer) {
-      const error = new FailedToConnectToTargetServer(
-        `Target server "${targetServer.name}" references catalog item "${targetServer.catalogItemId}", but it was not found in the catalog.`,
-      );
-      this.logger.error("Catalog item referenced by target server not found", {
-        name: targetServer.name,
-        catalogItemId: targetServer.catalogItemId,
-        error: loggableError(error),
-      });
-      return { _state: "connection-failed", targetServer, error };
-    }
-
-    const envRequirements =
-      catalogServer?.server.config.type === "stdio"
-        ? catalogServer.server.config.env
-        : undefined;
-
-    // Static OAuth configured means the server needs auth, even if a plain
-    // connect would succeed. Route through the OAuth path so it reuses tokens
-    // or transitions to pending-auth instead of finalizing without a provider.
-    if (
-      (targetServer.type === "sse" ||
-        targetServer.type === "streamable-http") &&
-      this.hasStaticOauthConfigured(targetServer)
-    ) {
-      this.logger.debug(
-        "Static OAuth configuration found for server, attempting OAuth flow",
-        { name: targetServer.name },
-      );
-      try {
-        return await this.initiateRemoteUnauthedClient(targetServer, isCurrent);
-      } catch (oauthError) {
-        return {
-          _state: "connection-failed",
-          targetServer,
-          error: makeError(oauthError),
-        };
-      }
-    }
-
-    try {
-      const extendedClient = await this.connectionFactory.createConnection(
-        targetServer,
-        envRequirements,
-        // Watermark headers from the catalog (see privateHeadersSchema).
-        catalogServer?.adminConfig?.privateHeaders,
-      );
-      return await this.finalizeConnection(
-        targetServer,
-        extendedClient,
-        isCurrent,
-      );
-    } catch (initialError) {
-      error = makeError(initialError);
-      if (!isCurrent())
-        return { _state: "connection-failed", targetServer, error };
-
-      // Check for pending input (missing env vars)
-      if (isPendingInputError(initialError)) {
-        this.logger.info("Server has missing environment variables", {
-          name: targetServer.name,
-          missingEnvVars: initialError.missingEnvVars,
-        });
-        return {
-          _state: "pending-input",
-          targetServer,
-          missingEnvVars: initialError.missingEnvVars,
-        };
-      }
-
-      // Check if OAuth is required
-      if (
-        isAuthenticationError(error) &&
-        (targetServer.type === "sse" || targetServer.type === "streamable-http")
-      ) {
-        // Server requires OAuth authentication
-        this.logger.warn(
-          "Server requires OAuth authentication, attempting OAuth flow",
-          { name: targetServer.name, type: targetServer.type },
-        );
-
-        // Attempt OAuth - this will try static OAuth if configured, or DCR as fallback
-        // If the provider can't be created (e.g., missing credentials), it will throw
-        try {
-          return await this.initiateRemoteUnauthedClient(
-            targetServer,
-            isCurrent,
-          );
-        } catch (oauthError) {
-          error = makeError(oauthError);
-          // Proceed to return connection-failed below
-        }
-      }
-
-      // For non-OAuth errors or stdio connections, return undefined
-      this.logger.error("Failed to initiate client", {
-        name: targetServer.name,
-        type: targetServer.type,
-        error: loggableError(error),
-      });
-      return { _state: "connection-failed", targetServer, error };
-    }
   }
 
   private getConnectedClientByName(
@@ -1822,15 +1734,26 @@ export class UpstreamHandler
       });
     });
     this.assertAuthTargetCurrent(targetServer);
-    const reauthedClient =
+    const reauth =
       await this.oauthConnectionHandler.safeTryWithExistingTokens(targetServer);
     this.assertAuthTargetCurrent(targetServer);
-    if (reauthedClient) {
-      const finalClient = await this.finalizeConnection(
+    if (reauth.kind === "rate-limited") {
+      await this.recordClientUpsert(this.connector.rateLimited(targetServer));
+      return null;
+    }
+    if (reauth.kind === "token-store-unavailable") {
+      await this.recordClientUpsert({
+        _state: "connection-failed",
         targetServer,
-        reauthedClient,
+        error: reauth.error,
+      });
+      this.enqueueReconnect(name);
+      return null;
+    }
+    if (reauth.kind === "connected") {
+      const finalClient = await this.recordClientUpsert(
+        await this.connector.finalize(targetServer, reauth.client),
       );
-      await this.recordClientUpsert(finalClient);
       if (isConnected(finalClient)) {
         this.logger.info("Silent re-auth succeeded", { name, context });
         return finalClient;
@@ -1871,61 +1794,6 @@ export class UpstreamHandler
       });
     }
     return null;
-  }
-
-  // Applies the auth component's verdict to our connection state. The decision
-  // itself lives in OAuthConnectionHandler.
-  private async initiateRemoteUnauthedClient(
-    targetServer: RemoteTargetServer,
-    isCurrent: () => boolean = () => true,
-  ): Promise<TargetClient> {
-    const verdict =
-      await this.oauthConnectionHandler.resolveExistingAuth(targetServer);
-    if (!isCurrent()) {
-      if (verdict.kind === "connected") await verdict.client.close();
-      throw new Error("Upstream connection was superseded");
-    }
-    const log = { name: targetServer.name, type: targetServer.type };
-
-    switch (verdict.kind) {
-      case "connected": {
-        const connected = await this.finalizeConnection(
-          targetServer,
-          verdict.client,
-          isCurrent,
-        );
-        return connected;
-      }
-      case "not-oauth":
-        this.logger.warn(
-          "Server returned 401 but does not advertise OAuth metadata; treating as connection failure",
-          log,
-        );
-        return {
-          _state: "connection-failed",
-          targetServer,
-          error: new Error(
-            "Authentication required, but server does not support OAuth",
-          ),
-        };
-      case "unreachable":
-        // Tokens kept; watchdog retries.
-        this.logger.info(
-          "Server unreachable, tokens preserved for reconnect",
-          log,
-        );
-        return {
-          _state: "connection-failed",
-          targetServer,
-          error: new Error("Server unreachable"),
-        };
-      case "needs-auth":
-        this.logger.info(
-          `Server requires OAuth authentication, call /auth/initiate/${targetServer.name} to start`,
-          log,
-        );
-        return this.transitionToPendingAuth(targetServer);
-    }
   }
 
   private startTokenExpiryMonitor(): void {
@@ -1991,14 +1859,9 @@ export class UpstreamHandler
   }
 
   private prepareForSystemState(
-    targetClient: TargetClient,
-    approvedTools: Tool[] = [],
-    originalTools?: Tool[],
-    approvedPrompts: Prompt[] = [],
-    originalPrompts?: Prompt[],
-    promptMessages?: Record<string, PromptMessage[]>,
-    displayName?: string,
+    props: Omit<PrepareForSystemStateProps, "estimateTokens">,
   ): TargetServerNewWithoutUsage {
+    const { targetClient } = props;
     const catalogEntry = this.catalogManager
       .getCatalog()
       .find((entry) =>
@@ -2013,16 +1876,10 @@ export class UpstreamHandler
       targetClient.targetServer.description?.trim() ||
       serverInfo?.description?.trim() ||
       catalogEntry?.description?.trim();
-    const server = prepareForSystemState(
-      targetClient,
-      (tool) => this.toolTokenEstimator.estimateTokens(tool),
-      approvedTools,
-      originalTools,
-      approvedPrompts,
-      originalPrompts,
-      promptMessages,
-      displayName,
-    );
+    const server = prepareForSystemState({
+      ...props,
+      estimateTokens: (tool) => this.toolTokenEstimator.estimateTokens(tool),
+    });
     return {
       ...server,
       description,

@@ -20,6 +20,7 @@ import {
   StoredTokens,
 } from "../services/oauth-token-store.js";
 import { applyExpiryPolicy, withExpiresAt } from "./token-helpers.js";
+import { mergeScopes } from "./scopes.js";
 
 // Special signal indicating device flow has completed and tokens are ready
 // This is not a real authorization code but a signal to the handler.
@@ -78,7 +79,7 @@ export class DeviceFlowOAuthProvider implements McpxOAuthProviderI {
   private authorizationCode: string | null = null;
   private authorizationUrl: URL | null = null;
   private deviceCode: string | null = null;
-  private discoveredScope: string | null = null;
+  private discoveredScopes: string[] = [];
   private userCode: string | null = null;
   private expiresAt: number | null = null;
   private cachedTokens: StoredTokens | null = null;
@@ -115,11 +116,7 @@ export class DeviceFlowOAuthProvider implements McpxOAuthProviderI {
   }
 
   get clientMetadata(): OAuthClientMetadata {
-    const baseScopes = this.config.scopes.join(" ");
-    const scope =
-      this.discoveredScope && !this.config.scopes.includes(this.discoveredScope)
-        ? `${baseScopes} ${this.discoveredScope}`
-        : baseScopes;
+    const scope = mergeScopes(this.config.scopes, this.discoveredScopes);
     return {
       redirect_uris: [this.redirectUrl],
       token_endpoint_auth_method: "none", // Device flow doesn't use client secret
@@ -131,8 +128,8 @@ export class DeviceFlowOAuthProvider implements McpxOAuthProviderI {
     };
   }
 
-  setDiscoveredScope(scope: string): void {
-    this.discoveredScope = scope;
+  setDiscoveredScopes(scopes: string[]): void {
+    this.discoveredScopes = scopes;
   }
 
   // Browser authorization parameters do not apply to RFC 8628 device flow.
@@ -208,7 +205,7 @@ export class DeviceFlowOAuthProvider implements McpxOAuthProviderI {
         throw new Error(`Device authorization failed: ${error}`);
       }
 
-      const data = await response.json();
+      const data: unknown = await response.json();
       const parsed = deviceCodeResponseSchema.safeParse(data);
       if (!parsed.success) {
         throw new Error(
@@ -310,19 +307,19 @@ export class DeviceFlowOAuthProvider implements McpxOAuthProviderI {
         body: params.toString(),
       });
 
-      const data = await response.json();
+      const data: unknown = await response.json();
       const parsed = tokenResponseSchema.safeParse(data);
       if (!parsed.success) {
         throw new Error(`Invalid token response: ${parsed.error.message}`);
       }
 
-      if (data.error) {
-        if (data.error === "authorization_pending") {
+      if (parsed.data.error) {
+        if (parsed.data.error === "authorization_pending") {
           this.logger.debug("Authorization pending", {
             serverName: this.serverName,
           });
           return;
-        } else if (data.error === "slow_down") {
+        } else if (parsed.data.error === "slow_down") {
           // RFC 8628 requires increasing polling interval by 5 seconds
           this.minPollInterval = Math.min(
             this.minPollInterval + POLLING_BUMP_INTERVAL.toMillis(),
@@ -335,7 +332,7 @@ export class DeviceFlowOAuthProvider implements McpxOAuthProviderI {
           return;
         } else {
           throw new Error(
-            `Token error: ${data.error} - ${data.error_description}`,
+            `Token error: ${parsed.data.error} - ${parsed.data.error_description}`,
           );
         }
       }

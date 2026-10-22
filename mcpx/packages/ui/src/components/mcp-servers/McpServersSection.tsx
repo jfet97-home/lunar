@@ -387,6 +387,7 @@ export function McpServersSection({ servers }: McpServersSectionProps) {
                 placeholder="Search tools, prompts and resources"
                 value={searchQuery}
                 onChange={(event) => setSearchQuery(event.target.value)}
+                data-pendo-locator="mcp-servers-search-input"
                 wrapperClassName="w-[320px] max-w-full"
               />
               <AnnotationFilterDropdown
@@ -574,6 +575,7 @@ function McpServerRow({
           className="flex min-w-0 flex-1 cursor-pointer items-center justify-between gap-5 px-4 py-3 text-left"
           onClick={onClick}
           aria-expanded={isExpanded}
+          data-pendo-locator="mcp-servers-server-row"
         >
           <div className="flex min-w-0 items-center gap-4">
             {domainIconUrl ? (

@@ -2,7 +2,7 @@ import { Logger } from "winston";
 import { backendDefaultServers } from "../server/constants-servers.js";
 import z from "zod/v4";
 import {
-  McpxBoundPayloads,
+  mcpxBoundPayloads,
   CatalogItemWire,
 } from "@mcpx/webapp-protocol/messages";
 import { normalizeServerName } from "@mcpx/toolkit-core/data";
@@ -15,6 +15,11 @@ import { EnvVarManager } from "./env-var-manager.js";
 import { IdentityServiceI } from "./identity-service.js";
 import { CapabilityKind } from "./capability-registry.js";
 
+type ClassifiedEnvEntry = {
+  protectedEntry: [string, EnvRequirement];
+  literal: [string, string] | null;
+};
+
 const DEFAULT_CATALOG_BY_NAME = new Map(
   backendDefaultServers.map((server) => [
     normalizeServerName(server.name),
@@ -22,7 +27,7 @@ const DEFAULT_CATALOG_BY_NAME = new Map(
   ]),
 );
 
-type SetCatalogPayload = z.infer<typeof McpxBoundPayloads.setCatalog>;
+type SetCatalogPayload = z.infer<typeof mcpxBoundPayloads.setCatalog>;
 
 // Single accessor for both capability kinds: tools and prompts are stored
 // symmetrically on adminConfig, so one kind-parameterized getter avoids the
@@ -37,10 +42,11 @@ function getApprovedNames(
 }
 
 // See unit tests for normalization logic (with edge cases)
-export function toProcessEnvKey(
-  serverName: string,
-  envVarName: string,
-): string {
+export function toProcessEnvKey(props: {
+  serverName: string;
+  envVarName: string;
+}): string {
+  const { serverName, envVarName } = props;
   return `MCPX_${serverName}_${envVarName}_PREFILLED`
     .toUpperCase()
     .replace(/[^A-Z0-9_]/g, "_")
@@ -89,8 +95,8 @@ export interface CatalogManagerI {
     id: string,
   ): ClientCredentialsOauthProvider | undefined;
   isServerApproved(serviceName: string): boolean;
-  isToolApproved(serviceName: string, toolName: string): boolean;
-  isPromptApproved(serviceName: string, promptName: string): boolean;
+  isToolApproved(props: { serverName: string; toolName: string }): boolean;
+  isPromptApproved(props: { serverName: string; promptName: string }): boolean;
   isHostInCatalog(host: string): boolean;
   subscribe(callback: (change: CatalogChange) => void): () => void;
 }
@@ -120,7 +126,9 @@ export class CatalogManager implements CatalogManagerI {
     // In enterprise mode, catalog starts empty (Hub controls it)
     // In personal mode, use fallback defaults
     const isEnterprise = identityService.getIdentity().mode === "enterprise";
-    this.catalogByName = isEnterprise ? new Map() : DEFAULT_CATALOG_BY_NAME;
+    this.catalogByName = isEnterprise
+      ? new Map<string, CatalogItemWire>()
+      : DEFAULT_CATALOG_BY_NAME;
     this.isStrictnessRequired = isStrictnessRequired;
     this.adminStrictnessOverride = !isStrictnessRequired; // admin strictness default match the system strictness
   }
@@ -283,27 +291,38 @@ export class CatalogManager implements CatalogManagerI {
     return this.catalogByName.has(normalizeServerName(serviceName));
   }
 
-  isToolApproved(serviceName: string, toolName: string): boolean {
-    return this.isCapabilityApproved("tools", serviceName, toolName);
+  isToolApproved(props: { serverName: string; toolName: string }): boolean {
+    const { serverName, toolName } = props;
+    return this.isCapabilityApproved({
+      kind: "tools",
+      serverName,
+      capabilityName: toolName,
+    });
   }
 
-  isPromptApproved(serviceName: string, promptName: string): boolean {
-    return this.isCapabilityApproved("prompts", serviceName, promptName);
+  isPromptApproved(props: { serverName: string; promptName: string }): boolean {
+    const { serverName, promptName } = props;
+    return this.isCapabilityApproved({
+      kind: "prompts",
+      serverName,
+      capabilityName: promptName,
+    });
   }
 
   // Single approval rule for both kinds: non-strict contexts approve everything,
   // an unknown server is denied, a server with no allowlist approves everything,
   // otherwise the name must be on the allowlist. Tools and prompts share this so
   // they cannot diverge (previously prompts skipped the strictness short-circuit).
-  private isCapabilityApproved(
-    kind: CapabilityKind,
-    serviceName: string,
-    capabilityName: string,
-  ): boolean {
+  private isCapabilityApproved(props: {
+    kind: CapabilityKind;
+    serverName: string;
+    capabilityName: string;
+  }): boolean {
+    const { kind, serverName, capabilityName } = props;
     if (!this.isStrict()) {
       return true;
     }
-    const server = this.catalogByName.get(normalizeServerName(serviceName));
+    const server = this.catalogByName.get(normalizeServerName(serverName));
     if (!server) {
       return false;
     }
@@ -416,14 +435,17 @@ export class CatalogManager implements CatalogManagerI {
     }
 
     const classified = Object.entries(config.env).map(
-      ([envVarName, requirement]) => {
+      ([envVarName, requirement]): ClassifiedEnvEntry => {
         if (!hasProtectableSecretLiteral(requirement)) {
           return {
             protectedEntry: [envVarName, requirement],
             literal: null,
           };
         }
-        const processEnvKey = toProcessEnvKey(item.server.name, envVarName);
+        const processEnvKey = toProcessEnvKey({
+          serverName: item.server.name,
+          envVarName,
+        });
         return {
           protectedEntry: [
             envVarName,

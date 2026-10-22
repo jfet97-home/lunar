@@ -8,7 +8,7 @@ import {
 import { normalizeServerName } from "@mcpx/toolkit-core/data";
 import { loggableError } from "@aigw/core/logging";
 import {
-  McpxBoundPayloads,
+  mcpxBoundPayloads,
   type TargetServerEntry,
   WebappBoundPayloadOf,
 } from "@mcpx/webapp-protocol/messages";
@@ -26,7 +26,7 @@ import {
 import { ServiceToolGroup } from "../model/config/permissions.js";
 import { resolveProviderKey } from "../oauth-providers/host-matcher.js";
 
-type ApplySetupPayload = z.infer<typeof McpxBoundPayloads.applySetup>;
+type ApplySetupPayload = z.infer<typeof mcpxBoundPayloads.applySetup>;
 type SetupConfigPayload = ApplySetupPayload["config"];
 
 export type CurrentSetup = Omit<WebappBoundPayloadOf<"setup-change">, "source">;
@@ -85,6 +85,8 @@ export function diffTargetServers({
 // Compare with normalized names so a casing-only difference isn't a change.
 // stableStringify ignores object-key order (the running config is zod-parsed,
 // the incoming one is raw wire JSON) but keeps array order.
+// A server added from the MCPX UI lists its keys in another order than its
+// copy the Hub sends back, so the entries are compared that way too.
 function sameTargetServer({
   current,
   incoming,
@@ -97,12 +99,19 @@ function sameTargetServer({
   incomingStaticOauth?: StaticOAuth;
 }): boolean {
   return (
-    stringifyEq(
-      { ...current, name: normalizeServerName(current.name) },
-      { ...incoming, name: normalizeServerName(incoming.name) },
-    ) &&
+    entryJson(current) === entryJson(incoming) &&
     stableStringify(resolveStaticOauthProvider(current, currentStaticOauth)) ===
       stableStringify(resolveStaticOauthProvider(incoming, incomingStaticOauth))
+  );
+}
+
+// The entry as the Hub stores it: JSON, so a key set to undefined drops out
+// (stableStringify alone would turn it into null), with sorted object keys.
+function entryJson(server: TargetServer): string {
+  return stableStringify(
+    JSON.parse(
+      JSON.stringify({ ...server, name: normalizeServerName(server.name) }),
+    ),
   );
 }
 
@@ -472,14 +481,14 @@ export class SetupManager implements SetupManagerI {
     // Filter out ephemeral groups (e.g., dynamic-capabilities) - they shouldn't be synced to hub
     const dynamicGroupNames = new Set(
       config.toolGroups
-        ?.filter((g) => g.owner === "dynamic-capabilities")
-        .map((g) => g.name) ?? [],
+        .filter((g) => g.owner === "dynamic-capabilities")
+        .map((g) => g.name),
     );
-    const userToolGroups = config.toolGroups?.filter(
+    const userToolGroups = config.toolGroups.filter(
       (g) => g.owner === undefined || g.owner === "user",
     );
     // Only include name and services in wire format (owner is local-only at the moment)
-    const normalizedToolGroups = userToolGroups?.map((toolGroup) => ({
+    const normalizedToolGroups = userToolGroups.map((toolGroup) => ({
       name: toolGroup.name,
       services: Object.fromEntries(
         Object.entries(toolGroup.services).map(([serviceName, markedTools]) => [
@@ -490,7 +499,7 @@ export class SetupManager implements SetupManagerI {
     }));
 
     // Filter out consumer permissions that reference dynamic groups
-    const consumers = config.permissions?.consumers ?? {};
+    const consumers = config.permissions.consumers;
     const filteredConsumers = Object.fromEntries(
       Object.entries(consumers).filter(
         ([, consumerConfig]) =>

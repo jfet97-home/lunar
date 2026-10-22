@@ -35,6 +35,14 @@ export type McpxSidebarSection = {
   items: McpxSidebarItem[];
 };
 
+const navigationLocators: Partial<Record<string, string>> = {
+  dashboard: "nav-dashboard-link",
+  "mcp-servers": "nav-mcp-servers-link",
+  "saved-setups": "nav-saved-setups-link",
+  "audit-log": "nav-audit-log-link",
+  "mcp-registry": "nav-mcp-registry-link",
+};
+
 const menuItemVariants = cva(
   "h-10 rounded-[var(--border-radius-sm)] px-2 py-2 text-sm font-normal leading-6 tracking-[-0.02em] text-[var(--mcpx-sidebar-text)] shadow-none hover:bg-[var(--mcpx-sidebar-active)] hover:text-mcpx-tooltip-text disabled:font-normal disabled:text-mcpx-text-disabled disabled:[&&]:opacity-100",
   {
@@ -186,7 +194,6 @@ function McpxSidebarMenuItem({
   const Icon = item.icon;
 
   const buttonClassName = menuItemVariants({ isActive });
-
   if (item.url && !item.disabled) {
     return (
       <SidebarMenuItem>
@@ -196,7 +203,7 @@ function McpxSidebarMenuItem({
           tooltip={item.label}
           className={buttonClassName}
         >
-          <Link to={item.url}>
+          <Link to={item.url} data-pendo-locator={navigationLocators[item.id]}>
             <Icon />
             <span>{item.label}</span>
           </Link>

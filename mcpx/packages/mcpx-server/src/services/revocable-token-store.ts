@@ -36,8 +36,8 @@ export class RevocableTokenStore {
         run(name, () => this.store.saveTokens(name, tokens)),
       loadCodeVerifier: (name) =>
         run(name, () => this.store.loadCodeVerifier(name)),
-      saveCodeVerifier: (name, verifier) =>
-        run(name, () => this.store.saveCodeVerifier(name, verifier)),
+      saveCodeVerifier: (props) =>
+        run(props.serverName, () => this.store.saveCodeVerifier(props)),
       loadClientInfo: (name) =>
         run(name, () => this.store.loadClientInfo(name)),
       saveClientInfo: (name, info) =>

@@ -1,7 +1,9 @@
 import { withAsyncPolling } from "@aigw/core/time";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import {
+  AccessDeniedError,
   InvalidGrantError,
+  InvalidRequestError,
   InvalidTokenError,
 } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
@@ -13,10 +15,11 @@ import {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import express from "express";
-import { createServer } from "http";
+import { createServer, STATUS_CODES } from "http";
 import { AddressInfo } from "net";
 import { randomBytes, randomUUID } from "node:crypto";
 import { z } from "zod";
+import { createRequestHold, RequestHold } from "./request-hold.js";
 import { MCPX_BASE_URL, TestHarness } from "./utils.js";
 
 export interface RefreshCounts {
@@ -26,6 +29,11 @@ export interface RefreshCounts {
   failed: number;
 }
 
+export interface McpFault {
+  status: number;
+  retryAfterSeconds?: number;
+}
+
 export interface MockOAuthServers {
   // The MCP server MCPX connects to, guarded by tokens from the authorization server.
   resourceServerUrl: string;
@@ -33,6 +41,13 @@ export interface MockOAuthServers {
   refreshes: RefreshCounts;
   // The next token request gets a load-balancer style 503, then service resumes.
   failNextTokenRequest: () => void;
+  setMcpFault: (fault: McpFault) => void;
+  clearMcpFault: () => void;
+  // Holds the next authenticated MCP request with this JSON-RPC method. A fault
+  // set while it is held applies when it is released.
+  holdNextMcpRequest: (method: string) => RequestHold;
+  getMcpFault: () => McpFault | undefined;
+  mcpRequests: { count: number };
   stop: () => Promise<void>;
 }
 
@@ -53,10 +68,17 @@ export async function startMockOAuthServers(props: {
   rotate: boolean;
   accessTokenTtlMs: number;
   staticClients?: OAuthClientInformationFull[];
+  scopesSupported?: string[];
+  rejectAuthorization?: "prompt" | "always";
+  authorizationError?: "invalid_request" | "access_denied";
+  port?: number;
 }): Promise<MockOAuthServers> {
   const { rotate, accessTokenTtlMs, staticClients = [] } = props;
   const refreshes: RefreshCounts = { ok: 0, reused: 0, unknown: 0, failed: 0 };
   const failures = { pending: 0 };
+  const mcpFault: { current?: McpFault } = {};
+  const mcpRequests = { count: 0 };
+  const mcpHolds = new Map<string, (() => Promise<void>)[]>();
   const clients = new Map<string, OAuthClientInformationFull>(
     staticClients.map((client) => [client.client_id, client]),
   );
@@ -106,6 +128,16 @@ export async function startMockOAuthServers(props: {
       },
     },
     authorize: async (_client, params, res) => {
+      if (
+        props.rejectAuthorization === "always" ||
+        (props.rejectAuthorization === "prompt" &&
+          res.req.query["prompt"] !== undefined)
+      ) {
+        if (props.authorizationError === "access_denied") {
+          throw new AccessDeniedError("unsupported prompt value requested");
+        }
+        throw new InvalidRequestError("unsupported prompt value requested");
+      }
       const code = randomBytes(16).toString("hex");
       codeChallenges.set(code, params.codeChallenge);
       const redirect = new URL(params.redirectUri);
@@ -155,7 +187,9 @@ export async function startMockOAuthServers(props: {
 
   const app = express();
   const httpServer = createServer(app);
-  await new Promise<void>((resolve) => httpServer.listen(0, resolve));
+  await new Promise<void>((resolve) =>
+    httpServer.listen(props.port ?? 0, resolve),
+  );
   const { port } = httpServer.address() as AddressInfo;
   const baseUrl = `http://localhost:${port}`;
   const resourceServerUrl = `${baseUrl}/mcp`;
@@ -172,6 +206,7 @@ export async function startMockOAuthServers(props: {
   app.use(
     mcpAuthRouter({
       provider,
+      scopesSupported: props.scopesSupported,
       issuerUrl: new URL(baseUrl),
       resourceServerUrl: new URL(resourceServerUrl),
       authorizationOptions: { rateLimit: false },
@@ -186,6 +221,25 @@ export async function startMockOAuthServers(props: {
       verifier: provider,
       resourceMetadataUrl: `${baseUrl}/.well-known/oauth-protected-resource/mcp`,
     }),
+    async (req, _res, next) => {
+      const method: unknown = req.body?.method;
+      if (typeof method === "string") {
+        await mcpHolds.get(method)?.shift()?.();
+      }
+      next();
+    },
+    (_req, res, next) => {
+      mcpRequests.count += 1;
+      const fault = mcpFault.current;
+      if (!fault) {
+        next();
+        return;
+      }
+      if (fault.retryAfterSeconds !== undefined) {
+        res.set("Retry-After", String(fault.retryAfterSeconds));
+      }
+      res.status(fault.status).send(STATUS_CODES[fault.status] ?? "Error");
+    },
     async (req, res) => {
       const mcp = new McpServer({ name: "mock-oauth-mcp", version: "1.0.0" });
       mcp.registerTool(
@@ -208,6 +262,19 @@ export async function startMockOAuthServers(props: {
     failNextTokenRequest: () => {
       failures.pending += 1;
     },
+    setMcpFault: (fault) => {
+      mcpFault.current = fault;
+    },
+    clearMcpFault: () => {
+      mcpFault.current = undefined;
+    },
+    getMcpFault: () => mcpFault.current,
+    holdNextMcpRequest: (method) => {
+      const { hold, wait } = createRequestHold();
+      mcpHolds.set(method, [...(mcpHolds.get(method) ?? []), wait]);
+      return hold;
+    },
+    mcpRequests,
     stop: async () => {
       if (!httpServer.listening) return;
       httpServer.closeAllConnections();
@@ -224,16 +291,16 @@ export async function logIn(props: {
 }): Promise<void> {
   const { harness, serverName, callbackUrl } = props;
   const { upstreamHandler } = harness.services;
-  const { authorizationUrl } = await upstreamHandler.initiateOAuthForServer(
-    serverName,
+  const { authorizationUrl } = await upstreamHandler.initiateOAuthForServer({
+    targetServerName: serverName,
     callbackUrl,
-  );
+  });
   const redirect = await fetch(authorizationUrl, { redirect: "manual" });
   const callback = new URL(redirect.headers.get("location") ?? "");
   const code = callback.searchParams.get("code");
   const state = callback.searchParams.get("state");
   if (!code || !state) throw new Error(`No code in ${callback}`);
-  await upstreamHandler.completeOAuthByState(state, code);
+  await upstreamHandler.completeOAuthByState({ state, code });
 }
 
 export async function readServerStateType(

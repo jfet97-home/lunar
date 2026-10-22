@@ -35,8 +35,7 @@
     "build:deps:one": "cd ../.. && npm run build:deps:one"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "yaml": "^2.8.3",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "zod": "^3.25.76"
   },
   "devDependencies": {

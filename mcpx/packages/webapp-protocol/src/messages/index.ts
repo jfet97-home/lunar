@@ -1,10 +1,11 @@
 export * from "./mcpx-bound/messages.js";
 export {
-  Envelope,
+  envelopeSchema,
   wrapInEnvelope,
   safeParseEnvelopedMessage,
 } from "./metadata.js";
 export type { EnvelopedMessage, Metadata } from "./metadata.js";
+export { HUB_SOCKET_MAX_MESSAGE_BYTES } from "./limits.js";
 export * from "./shared/index.js";
 export * from "./webapp-bound/messages.js";
 export { targetServerStatus } from "./webapp-bound/usage-stats.js";

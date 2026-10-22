@@ -26,7 +26,10 @@ export interface ResponsesParsedResponse<T> {
 
 export interface OpenAiClientInterface {
   responses: {
-    parse<T>(params: ResponsesParseParams): Promise<ResponsesParsedResponse<T>>;
+    parse<T>(
+      params: ResponsesParseParams,
+      options?: { signal?: AbortSignal },
+    ): Promise<ResponsesParsedResponse<T>>;
   };
 }
 
@@ -38,18 +41,24 @@ export class OpenAiLlmClient implements LlmClient {
   private client: OpenAiClientInterface;
   private model: string;
 
-  constructor(
-    apiKey: string,
-    model: string,
-    openAiClient?: OpenAiClientInterface,
-  ) {
+  constructor(params: {
+    apiKey: string;
+    model: string;
+    openAiClient?: OpenAiClientInterface;
+  }) {
+    const { apiKey, model, openAiClient } = params;
     this.client = openAiClient ?? new OpenAI({ apiKey });
     this.model = model;
   }
 
   async complete<T>(params: LlmCompletionParams<T>): Promise<T> {
-    const { systemPrompt, messages, responseSchema } = params;
-    const response = await this.callApi(systemPrompt, messages, responseSchema);
+    const { systemPrompt, messages, responseSchema, abortSignal } = params;
+    const response = await this.callApi(
+      systemPrompt,
+      messages,
+      responseSchema,
+      abortSignal,
+    );
 
     if (!response.output_parsed) {
       throw new LlmEmptyResponseError("OpenAI");
@@ -62,6 +71,7 @@ export class OpenAiLlmClient implements LlmClient {
     systemPrompt: string,
     messages: LlmMessage[],
     responseSchema: z.ZodSchema<T>,
+    abortSignal?: AbortSignal,
   ): Promise<ResponsesParsedResponse<T>> {
     const input: Array<{
       role: "system" | "user" | "assistant";
@@ -72,11 +82,14 @@ export class OpenAiLlmClient implements LlmClient {
     ];
 
     try {
-      return await this.client.responses.parse({
-        model: this.model,
-        input,
-        text: { format: zodTextFormat(responseSchema, "response") },
-      });
+      return await this.client.responses.parse(
+        {
+          model: this.model,
+          input,
+          text: { format: zodTextFormat(responseSchema, "response") },
+        },
+        { signal: abortSignal },
+      );
     } catch (e) {
       throw new LlmApiError("OpenAI", e);
     }

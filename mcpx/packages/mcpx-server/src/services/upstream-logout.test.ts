@@ -632,7 +632,10 @@ describe("upstream recovery and OAuth logout", () => {
       );
       const authRecovery = jest
         .spyOn(harness.oauth, "safeTryWithExistingTokens")
-        .mockResolvedValue(harness.extended as unknown as ExtendedClientI);
+        .mockResolvedValue({
+          kind: "connected",
+          client: harness.extended as unknown as ExtendedClientI,
+        });
       await expect(
         harness.upstream.callTool("docs", { name: "read" }),
       ).resolves.toEqual({ content: [] });
@@ -889,9 +892,10 @@ describe("upstream recovery and OAuth logout", () => {
       harness.extended.listTools.mockRejectedValueOnce(
         new Error("fetch failed"),
       );
-      jest
-        .spyOn(harness.oauth, "safeTryWithExistingTokens")
-        .mockResolvedValue(harness.extended as unknown as ExtendedClientI);
+      jest.spyOn(harness.oauth, "safeTryWithExistingTokens").mockResolvedValue({
+        kind: "connected",
+        client: harness.extended as unknown as ExtendedClientI,
+      });
       await expect(
         harness.upstream.callTool("docs", { name: "read" }),
       ).rejects.toThrow();
@@ -1165,11 +1169,11 @@ describe("upstream recovery and OAuth logout", () => {
     async (serverName) => {
       const harness = await makeHarness(serverName);
       try {
-        harness.sessions.startOAuthFlow(
+        harness.sessions.startOAuthFlow({
           serverName,
-          harness.targetServer.url,
-          "old-state",
-        );
+          serverUrl: harness.targetServer.url,
+          state: "old-state",
+        });
         expect(harness.resolver.resolveToolCall("docs__read", {}).ok).toBe(
           true,
         );
@@ -1203,7 +1207,9 @@ describe("upstream recovery and OAuth logout", () => {
             token_type: "bearer",
           }),
         ).rejects.toThrow("authentication was cleared");
-        const login = await harness.upstream.initiateOAuthForServer("docs");
+        const login = await harness.upstream.initiateOAuthForServer({
+          targetServerName: "docs",
+        });
         expect(new URL(login.authorizationUrl).pathname).toBe("/login");
         expect(harness.sessions.getOAuthFlow(login.state)).toBeDefined();
       } finally {
@@ -1229,7 +1235,9 @@ describe("upstream recovery and OAuth logout", () => {
         };
       });
     try {
-      await harness.upstream.initiateOAuthForServer("docs");
+      await harness.upstream.initiateOAuthForServer({
+        targetServerName: "docs",
+      });
       harness.upstream.updateClientDescription("docs", "Updated description");
       await harness.upstream.logoutOAuthForServer("docs");
       await expect(

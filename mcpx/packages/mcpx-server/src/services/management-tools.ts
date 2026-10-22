@@ -291,10 +291,10 @@ export class ManagementToolsService implements InternalCapabilityProvider {
         schema: namedSchema,
         execute: async (args): Promise<unknown> => {
           const { name } = namedSchema.parse(args);
-          const auth = await services.upstreamHandler.initiateOAuthForServer(
-            name,
-            this.callbackUrl,
-          );
+          const auth = await services.upstreamHandler.initiateOAuthForServer({
+            targetServerName: name,
+            callbackUrl: this.callbackUrl,
+          });
           return {
             name,
             authorizationUrl: auth.authorizationUrl,

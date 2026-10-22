@@ -588,13 +588,24 @@ export default function McpRegistry() {
             }}
           >
             <CustomTabsList className="mb-4">
-              <CustomTabsTrigger value={TABS.ALL}>All</CustomTabsTrigger>
+              <CustomTabsTrigger
+                value={TABS.ALL}
+                data-pendo-locator="registry-all-tab"
+              >
+                All
+              </CustomTabsTrigger>
               {canAddCustom && (
                 <>
-                  <CustomTabsTrigger value={TABS.CUSTOM}>
+                  <CustomTabsTrigger
+                    value={TABS.CUSTOM}
+                    data-pendo-locator="registry-custom-tab"
+                  >
                     Custom
                   </CustomTabsTrigger>
-                  <CustomTabsTrigger value={TABS.MIGRATE}>
+                  <CustomTabsTrigger
+                    value={TABS.MIGRATE}
+                    data-pendo-locator="registry-migrate-tab"
+                  >
                     Migrate
                   </CustomTabsTrigger>
                 </>
@@ -608,6 +619,7 @@ export default function McpRegistry() {
                 <div className="mb-4 flex flex-wrap items-center gap-3">
                   <SearchInput
                     onChange={(event) => setSearch(event.target.value)}
+                    data-pendo-locator="registry-search-input"
                     placeholder="Search..."
                     wrapperClassName="w-[320px] max-w-full ml-[3px]"
                     className="h-9 border-mcpx-border"

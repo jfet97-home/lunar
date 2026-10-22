@@ -50,28 +50,47 @@ describe("DcrOAuthProvider#redirectToAuthorization", () => {
     expect(provider.getAuthorizationUrl()?.host).toBe("mcp.notion.com");
   });
 
+  it("removes an SDK prompt when no prompt was selected", async () => {
+    const provider = makeProvider();
+    const authUrl = new URL("https://mcp.notion.com/authorize?prompt=consent");
+    await provider.redirectToAuthorization(authUrl);
+    expect(authUrl.searchParams.has("prompt")).toBe(false);
+  });
+
+  it("keeps supported SDK consent with account selection", async () => {
+    const provider = makeProvider();
+    provider.setExtraAuthorizationParams({
+      consentSupported: true,
+      prompt: ["select_account"],
+    });
+    const authUrl = new URL("https://mcp.notion.com/authorize?prompt=consent");
+
+    await provider.redirectToAuthorization(authUrl);
+
+    expect(authUrl.searchParams.getAll("prompt")).toEqual([
+      "consent select_account",
+    ]);
+  });
+
   it("adds Google offline access and consent to the authorization URL", async () => {
     const provider = makeProvider();
     provider.setExtraAuthorizationParams({
       access_type: "offline",
-      prompt: "consent",
+      prompt: ["consent"],
     });
     const authUrl = new URL("https://accounts.google.com/o/oauth2/v2/auth");
 
     await provider.redirectToAuthorization(authUrl);
 
     expect(authUrl.searchParams.get("access_type")).toBe("offline");
-    expect(authUrl.searchParams.get("prompt")?.split(" ")).toEqual([
-      "consent",
-      "select_account",
-    ]);
+    expect(authUrl.searchParams.get("prompt")?.split(" ")).toEqual(["consent"]);
   });
 
-  it("overwrites access_type and preserves existing prompts without duplicating consent", async () => {
+  it("overwrites SDK defaults with the selected authorization parameters", async () => {
     const provider = makeProvider();
     provider.setExtraAuthorizationParams({
       access_type: "offline",
-      prompt: "consent",
+      prompt: ["consent"],
     });
     const authUrl = new URL(
       "https://accounts.google.com/o/oauth2/v2/auth?access_type=online&prompt=login%20consent",
@@ -80,18 +99,13 @@ describe("DcrOAuthProvider#redirectToAuthorization", () => {
     await provider.redirectToAuthorization(authUrl);
 
     expect(authUrl.searchParams.getAll("access_type")).toEqual(["offline"]);
-    expect(authUrl.searchParams.get("prompt")?.split(" ")).toEqual([
-      "login",
-      "consent",
-      "select_account",
-    ]);
+    expect(authUrl.searchParams.get("prompt")?.split(" ")).toEqual(["consent"]);
   });
 });
 
-const ROUTER = "https://mcpx-stg.lunar.dev";
+const MCPX_URL = "https://mcpx-stg.lunar.dev";
 // Derived from the shared contract, so a change there fails here too.
-const CIMD_URL = `${ROUTER}${CLIENT_METADATA_PATH}`;
-const WEBSERVER = "https://app-stg.lunar.dev";
+const CIMD_URL = `${MCPX_URL}${CLIENT_METADATA_PATH}`;
 
 describe("DcrOAuthProvider#applyPublishedDocument (CIMD)", () => {
   // Touch only the keys under test; the suite's own env stays intact.
@@ -104,8 +118,8 @@ describe("DcrOAuthProvider#applyPublishedDocument (CIMD)", () => {
   };
 
   // Shared builder — stays in sync with what the router publishes.
-  const published = (webserverPublicUrl?: string): PublishedClientMetadata =>
-    buildClientMetadataDocument({ baseUrl: ROUTER, webserverPublicUrl });
+  const published = (): PublishedClientMetadata =>
+    buildClientMetadataDocument({ baseUrl: MCPX_URL });
 
   // undefined document = "could not be read", not a default.
   const resolve = (
@@ -116,7 +130,7 @@ describe("DcrOAuthProvider#applyPublishedDocument (CIMD)", () => {
   ): DcrOAuthProvider => {
     const provider = new DcrOAuthProvider({
       serverName: "chili-piper",
-      callbackUrl: params.callbackUrl ?? `${ROUTER}/auth/callback`,
+      callbackUrl: params.callbackUrl ?? `${MCPX_URL}/auth/callback`,
       logger: noOpLogger,
       tokenStore: stubTokenStore,
     });
@@ -129,7 +143,7 @@ describe("DcrOAuthProvider#applyPublishedDocument (CIMD)", () => {
       VERSION: "1.0.0", // required by the env schema, unrelated to CIMD
       INSTANCE_ID: "0",
       INSTANCE_KEY: "space-123", // IS_ENTERPRISE is derived from this
-      MCPX_SERVER_URL: ROUTER,
+      MCPX_SERVER_URL: MCPX_URL,
     });
   });
 
@@ -141,20 +155,10 @@ describe("DcrOAuthProvider#applyPublishedDocument (CIMD)", () => {
     expect(resolve({ document: published() }).clientMetadataUrl).toBe(CIMD_URL);
   });
 
-  it("uses it for the webserver callback that catalog analysis sends", () => {
-    // Cross-origin callback — only works if the router published it.
-    const document = published(WEBSERVER);
-
-    expect(
-      resolve({ callbackUrl: `${WEBSERVER}/oauth/callback`, document })
-        .clientMetadataUrl,
-    ).toBe(CIMD_URL);
-  });
-
   it("declines when the document omits this flow's callback", () => {
     // invalid_redirect_uri; SDK has no DCR fallback with a client id.
     const provider = resolve({
-      callbackUrl: `${WEBSERVER}/oauth/callback`,
+      callbackUrl: `${MCPX_URL}/oauth/callback`,
       document: published(),
     });
 
@@ -207,7 +211,7 @@ describe("DcrOAuthProvider#applyPublishedDocument (CIMD)", () => {
     // (crds/mcpx.ts). A trailing slash must not surface as "the router
     // declares a different client_id" — that's a local config issue, not
     // the router's.
-    setEnv({ MCPX_SERVER_URL: `${ROUTER}/` });
+    setEnv({ MCPX_SERVER_URL: `${MCPX_URL}/` });
 
     expect(resolve({ document: published() }).clientMetadataUrl).toBe(CIMD_URL);
   });
@@ -223,7 +227,7 @@ describe("DcrOAuthProvider#saveClientInformation", () => {
     let stored: OAuthClientInformationFull | undefined;
     const provider = new DcrOAuthProvider({
       serverName: "chili-piper",
-      callbackUrl: `${ROUTER}/auth/callback`,
+      callbackUrl: `${MCPX_URL}/auth/callback`,
       logger: noOpLogger,
       tokenStore: {
         ...stubTokenStore,
@@ -251,7 +255,7 @@ describe("DcrOAuthProvider#saveClientInformation", () => {
 
     const loaded = await provider.clientInformation();
     expect(loaded?.client_id).toBe(CIMD_URL);
-    expect(loaded?.redirect_uris).toEqual([`${ROUTER}/auth/callback`]);
+    expect(loaded?.redirect_uris).toEqual([`${MCPX_URL}/auth/callback`]);
   });
 
   it("keeps a DCR registration's own fields", async () => {
@@ -276,9 +280,9 @@ describe("the CIMD document shape", () => {
   // its shape claim. The assignment is the check: it stops compiling on drift.
   it("stays assignable to the SDK's client metadata", () => {
     const doc: OAuthClientMetadata = buildClientMetadataDocument({
-      baseUrl: ROUTER,
+      baseUrl: MCPX_URL,
     });
 
-    expect(doc.redirect_uris).toEqual([`${ROUTER}/auth/callback`]);
+    expect(doc.redirect_uris).toEqual([`${MCPX_URL}/auth/callback`]);
   });
 });

@@ -379,6 +379,7 @@ export default function SavedSetups() {
           </Button>
           <Button
             size={"lg"}
+            data-pendo-locator="saved-setups-save-current-setup-button"
             onClick={() => setIsSaveDialogOpen(true)}
             className="bg-primary hover:bg-primary/80 text-primary-foreground"
           >
@@ -668,6 +669,7 @@ export default function SavedSetups() {
               </Button>
               <Button
                 onClick={handleSave}
+                data-pendo-locator="saved-setups-save-setup-dialog-save-button"
                 disabled={
                   !description.trim() ||
                   hasInvalidCharacters ||

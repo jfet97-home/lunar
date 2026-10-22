@@ -6,7 +6,7 @@ import {
   DynamicCapabilitiesMatchingAck,
   DynamicCapabilitiesMatchingPayload,
   dynamicCapabilitiesMatchingAckSchema,
-  McpxBoundPayloads,
+  mcpxBoundPayloads,
   safeParseEnvelopedMessage,
   SetPersonalSkillsPayload,
   SetPublishedSkillsPayload,
@@ -31,7 +31,7 @@ import {
   TargetServerChangeNotifier,
 } from "./upstream-handler.js";
 import { ReArmBackoff } from "./hub-backoff.js";
-import { ThrottledSender } from "./throttled-sender.js";
+import { ThrottledMessage, ThrottledSender } from "./throttled-sender.js";
 import { createToolCallBatcher, ToolCallBatcher } from "./tool-call-batcher.js";
 import { UsageStatsSender } from "./usage-stats-sender.js";
 
@@ -133,43 +133,39 @@ function isValidPhaseSequence(phases: BootPhase[]): boolean {
 }
 
 const envelopedApplySetupSafeParse = safeParseEnvelopedMessage(
-  McpxBoundPayloads.applySetup,
+  mcpxBoundPayloads.applySetup,
 );
 
 const envelopedLoadCatalogSafeParse = safeParseEnvelopedMessage(
-  McpxBoundPayloads.setCatalog,
+  mcpxBoundPayloads.setCatalog,
 );
 
 const envelopedInitiateOAuthSafeParse = safeParseEnvelopedMessage(
-  McpxBoundPayloads.initiateOAuth,
-);
-
-const envelopedCompleteOAuthSafeParse = safeParseEnvelopedMessage(
-  McpxBoundPayloads.completeOAuth,
+  mcpxBoundPayloads.initiateOAuth,
 );
 
 const envelopedSetIdentitySafeParse = safeParseEnvelopedMessage(
-  McpxBoundPayloads.setIdentity,
+  mcpxBoundPayloads.setIdentity,
 );
 
 const envelopedSetBehaviorSafeParse = safeParseEnvelopedMessage(
-  McpxBoundPayloads.setMcpxBehavior,
+  mcpxBoundPayloads.setMcpxBehavior,
 );
 
 const envelopedSetProfileSecretsSafeParse = safeParseEnvelopedMessage(
-  McpxBoundPayloads.setProfileSecrets,
+  mcpxBoundPayloads.setProfileSecrets,
 );
 
 const envelopedSetOauthCredentialsSafeParse = safeParseEnvelopedMessage(
-  McpxBoundPayloads.setOauthCredentials,
+  mcpxBoundPayloads.setOauthCredentials,
 );
 
 const envelopedSetPersonalSkillsSafeParse = safeParseEnvelopedMessage(
-  McpxBoundPayloads.setPersonalSkills,
+  mcpxBoundPayloads.setPersonalSkills,
 );
 
 const envelopedSetPublishedSkillsSafeParse = safeParseEnvelopedMessage(
-  McpxBoundPayloads.setPublishedSkills,
+  mcpxBoundPayloads.setPublishedSkills,
 );
 
 export interface HubServiceOptions {
@@ -179,6 +175,8 @@ export interface HubServiceOptions {
   reconnectionDelayMax?: number;
   handshakeRetryDelayMax?: number;
   toolCallBatchIntervalMs?: number;
+  // Where providers send the browser back after sign-in; the MCPX's /auth/callback.
+  oauthCallbackUrl?: string;
 }
 
 export type BootPhase =
@@ -223,6 +221,7 @@ export class HubService {
   private readonly connectionTimeout: number;
   private readonly reconnectionDelayMax: number;
   private readonly handshakeRetryDelayMax: number;
+  private readonly oauthCallbackUrl: string | undefined;
   private readonly setupChangeSender: ThrottledSender;
   private readonly usageStatsSender: UsageStatsSender;
   private readonly toolCallBatcher: ToolCallBatcher;
@@ -269,10 +268,12 @@ export class HubService {
       options.reconnectionDelayMax ?? env.HUB_RECONNECT_DELAY_MAX_MS;
     this.handshakeRetryDelayMax =
       options.handshakeRetryDelayMax ?? env.HUB_HANDSHAKE_RETRY_DELAY_MAX_MS;
+    this.oauthCallbackUrl = options.oauthCallbackUrl;
 
     const createSender =
       (eventName: WebappBoundEventName) =>
-      (_key: string, payload: unknown, correlationId?: string): void => {
+      (message: ThrottledMessage): void => {
+        const { payload, correlationId } = message;
         if (!this.socket || this.status.status !== "authenticated") {
           this.logger.debug("Cannot send message, not connected to Hub");
           return;
@@ -507,7 +508,11 @@ export class HubService {
     payload: WebappBoundPayloadOf<"setup-change">,
     correlationId?: string,
   ): void {
-    this.setupChangeSender.sendNow("setup-change", payload, correlationId);
+    this.setupChangeSender.sendNow({
+      key: "setup-change",
+      payload,
+      correlationId,
+    });
   }
 
   async emitDynamicCapabilitiesMatching(
@@ -521,7 +526,7 @@ export class HubService {
       messageId: envelope.metadata.id,
     });
     try {
-      const ack = await this.socket
+      const ack: unknown = await this.socket
         .timeout(env.LLM_REQUEST_TIMEOUT_MS)
         .emitWithAck(
           WEBAPP_BOUND_EVENTS.DYNAMIC_CAPABILITIES_MATCHING,
@@ -592,7 +597,7 @@ export class HubService {
       this.handleConnectionDrop({ afterConnect: true });
     });
 
-    this.socket.on("apply-setup", async (envelope) => {
+    this.socket.on("apply-setup", async (envelope: unknown) => {
       try {
         const parseResult = envelopedApplySetupSafeParse(envelope);
         if (!parseResult.success) {
@@ -627,7 +632,7 @@ export class HubService {
 
     this.socket.on(
       "set-catalog",
-      async (envelope, ack?: (res: { ok: boolean }) => void) => {
+      async (envelope: unknown, ack?: (res: { ok: boolean }) => void) => {
         try {
           const parseResult = envelopedLoadCatalogSafeParse(envelope);
           if (!parseResult.success) {
@@ -663,7 +668,7 @@ export class HubService {
 
     this.socket.on(
       "set-identity",
-      (envelope, ack?: (res: { ok: boolean }) => void) => {
+      (envelope: unknown, ack?: (res: { ok: boolean }) => void) => {
         try {
           const parseResult = envelopedSetIdentitySafeParse(envelope);
           if (!parseResult.success) {
@@ -695,7 +700,7 @@ export class HubService {
 
     this.socket.on(
       "set-mcpx-behavior",
-      (envelope, ack?: (res: Ack) => void) => {
+      (envelope: unknown, ack?: (res: Ack) => void) => {
         try {
           const parseResult = envelopedSetBehaviorSafeParse(envelope);
           if (!parseResult.success) {
@@ -742,7 +747,7 @@ export class HubService {
 
     this.socket.on(
       "set-personal-skills",
-      (envelope, ack?: (res: { ok: boolean }) => void) => {
+      (envelope: unknown, ack?: (res: { ok: boolean }) => void) => {
         try {
           const parseResult = envelopedSetPersonalSkillsSafeParse(envelope);
           if (!parseResult.success) {
@@ -772,7 +777,7 @@ export class HubService {
 
     this.socket.on(
       "set-published-skills",
-      (envelope, ack?: (res: { ok: boolean }) => void) => {
+      (envelope: unknown, ack?: (res: { ok: boolean }) => void) => {
         try {
           const parseResult = envelopedSetPublishedSkillsSafeParse(envelope);
           if (!parseResult.success) {
@@ -815,7 +820,7 @@ export class HubService {
 
     this.socket.on(
       "set-profile-secrets",
-      (envelope, ack?: (res: Ack) => void) => {
+      (envelope: unknown, ack?: (res: Ack) => void) => {
         try {
           const parseResult = envelopedSetProfileSecretsSafeParse(envelope);
           if (!parseResult.success) {
@@ -860,7 +865,7 @@ export class HubService {
 
     this.socket.on(
       "set-oauth-credentials",
-      (envelope, ack?: (res: Ack) => void) => {
+      (envelope: unknown, ack?: (res: Ack) => void) => {
         try {
           const parseResult = envelopedSetOauthCredentialsSafeParse(envelope);
           if (!parseResult.success) {
@@ -903,7 +908,7 @@ export class HubService {
       },
     );
 
-    this.socket.on("initiate-oauth", async (envelope) => {
+    this.socket.on("initiate-oauth", async (envelope: unknown) => {
       try {
         const parseResult = envelopedInitiateOAuthSafeParse(envelope);
         if (!parseResult.success) {
@@ -921,16 +926,15 @@ export class HubService {
           correlationId,
         });
 
-        const result = await this.upstreamHandler.initiateOAuthForServer(
-          message.serverName,
-          message.callbackUrl,
-        );
+        const result = await this.upstreamHandler.initiateOAuthForServer({
+          targetServerName: message.serverName,
+          callbackUrl: this.oauthCallbackUrl,
+        });
 
         // Send oauth-authorization-required response back to Hub
         const responsePayload = {
           serverName: message.serverName,
           authorizationUrl: result.authorizationUrl,
-          state: result.state,
           userCode: result.userCode,
         };
         const envelopedResponse = wrapInEnvelope({
@@ -944,36 +948,6 @@ export class HubService {
         });
       } catch (e) {
         this.logger.error("Failed to handle initiate-oauth", {
-          ...loggableError(e),
-          envelope,
-        });
-      }
-    });
-
-    this.socket.on("complete-oauth", async (envelope) => {
-      try {
-        const parseResult = envelopedCompleteOAuthSafeParse(envelope);
-        if (!parseResult.success) {
-          this.logger.error("Failed to parse complete-oauth message", {
-            error: parseResult.error,
-            envelope,
-          });
-          return;
-        }
-        const message = parseResult.data.payload;
-        this.logger.info("Received complete-oauth message from Hub", {
-          serverName: message.serverName,
-        });
-
-        await this.upstreamHandler.completeOAuthByState(
-          message.state,
-          message.authorizationCode,
-        );
-        this.logger.info("OAuth flow completed", {
-          serverName: message.serverName,
-        });
-      } catch (e) {
-        this.logger.error("Failed to handle complete-oauth", {
           ...loggableError(e),
           envelope,
         });

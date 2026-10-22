@@ -4,14 +4,38 @@ import { Logger } from "winston";
 import { z } from "zod/v4";
 import { UpstreamHandler } from "../services/upstream-handler.js";
 
-const OAuthCallbackQuerySchema = z.looseObject({
+const oauthCallbackQuerySchema = z.looseObject({
   code: z.string().optional(),
   state: z.string().optional(),
   error: z.string().optional(),
 });
 
+function callbackPage(options: {
+  title: string;
+  heading: string;
+  type: "error" | "info";
+  message: string;
+}): string {
+  return `
+      <html>
+        <head>
+          <title>${options.title}</title>
+          <style>
+            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
+            .error { color: #dc3545; }
+            .info { color: #6c757d; }
+          </style>
+        </head>
+        <body>
+          <h1 class="${options.type}">${options.heading}</h1>
+          <p class="info">${options.message}</p>
+        </body>
+      </html>
+    `;
+}
+
 export function buildOAuthRouter(
-  upstreamHandler: UpstreamHandler,
+  upstreamHandler: Pick<UpstreamHandler, "completeOAuthByState">,
   logger: Logger,
 ): express.Router {
   const router = express.Router();
@@ -23,7 +47,12 @@ export function buildOAuthRouter(
   router.get(
     "/oauth/callback",
     async (req: express.Request, res: express.Response) => {
-      const parseResult = OAuthCallbackQuerySchema.safeParse(req.query);
+      const requestContext = {
+        secFetchSite: req.get("Sec-Fetch-Site"),
+        secFetchUser: req.get("Sec-Fetch-User"),
+        userAgent: req.get("User-Agent"),
+      };
+      const parseResult = oauthCallbackQuerySchema.safeParse(req.query);
       if (!parseResult.success) {
         logger.error("OAuth callback failed to parse query", {
           errors: z.treeifyError(parseResult.error),
@@ -50,9 +79,29 @@ export function buildOAuthRouter(
       }
 
       try {
-        await upstreamHandler.completeOAuthByState(state, code);
+        const outcome = await upstreamHandler.completeOAuthByState({
+          state,
+          code,
+        });
 
-        logger.info("OAuth callback successful", { state });
+        if (outcome === "unknown-state") {
+          logger.warn("OAuth callback for unknown state", {
+            state,
+            ...requestContext,
+          });
+          res.status(404).send(
+            callbackPage({
+              title: "This sign-in link is no longer active",
+              heading: "This sign-in link is no longer active",
+              type: "info",
+              message:
+                "If you just signed in, you're all set. You can close this window.",
+            }),
+          );
+          return;
+        }
+
+        logger.info("OAuth callback successful", { state, ...requestContext });
 
         res.send(`
       <html>
@@ -96,24 +145,17 @@ export function buildOAuthRouter(
       } catch (err) {
         logger.error("OAuth callback failed to complete connection", {
           state,
+          ...requestContext,
           error: loggableError(err),
         });
-        res.status(500).send(`
-      <html>
-        <head>
-          <title>OAuth Authorization Failed</title>
-          <style>
-            body { font-family: Arial, sans-serif; text-align: center; padding: 50px; }
-            .error { color: #dc3545; }
-            .info { color: #6c757d; }
-          </style>
-        </head>
-        <body>
-          <h1 class="error">❌ Authorization Failed</h1>
-          <p class="info">Failed to complete the connection. Please try again.</p>
-        </body>
-      </html>
-    `);
+        res.status(500).send(
+          callbackPage({
+            title: "OAuth Authorization Failed",
+            heading: "❌ Authorization Failed",
+            type: "error",
+            message: "Failed to complete the connection. Please try again.",
+          }),
+        );
       }
     },
   );

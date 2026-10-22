@@ -332,7 +332,10 @@ describe("built-in management tools", () => {
     });
     expect(
       services.upstreamHandler.initiateOAuthForServer,
-    ).toHaveBeenCalledWith("docs", "http://localhost:9523/auth/callback");
+    ).toHaveBeenCalledWith({
+      targetServerName: "docs",
+      callbackUrl: "http://localhost:9523/auth/callback",
+    });
     expect(
       json(await call("management_logout_server", { name: "docs" })),
     ).toEqual({ name: "docs", loggedOut: true });

@@ -94,7 +94,7 @@ function registerLegacySseMessagesRoute(
     ) {
       services.sessions.updateSessionMetadata(
         sessionId,
-        mergeMetadata(session.metadata, metadata),
+        mergeMetadata({ current: session.metadata, incoming: metadata }),
       );
     }
     services.sessions.touchSession(sessionId, TouchSource.TransportPostMcp);
@@ -190,7 +190,10 @@ function registerTransportRoutes(
       return true;
     }
     const resolvedMetadata = incomingMetadata
-      ? mergeMetadata(persisted.metadata, incomingMetadata)
+      ? mergeMetadata({
+          current: persisted.metadata,
+          incoming: incomingMetadata,
+        })
       : persisted.metadata;
     routeLogger.info("Transparently restoring session", {
       sessionId,
@@ -252,7 +255,7 @@ function registerTransportRoutes(
           return;
         }
         const resolvedMetadata = persisted
-          ? mergeMetadata(persisted.metadata, metadata)
+          ? mergeMetadata({ current: persisted.metadata, incoming: metadata })
           : metadata;
         routeLogger.info(
           "Reinitializing expired session on initialize request",
@@ -314,7 +317,7 @@ function registerTransportRoutes(
     if (shouldUpdateMetadata) {
       services.sessions.updateSessionMetadata(
         sessionId,
-        mergeMetadata(session.metadata, metadata),
+        mergeMetadata({ current: session.metadata, incoming: metadata }),
       );
     }
     services.sessions.touchSession(sessionId, TouchSource.TransportPostMcp);
@@ -487,10 +490,11 @@ function hasClientInfo(
   );
 }
 
-function mergeMetadata(
-  current: McpxSession["metadata"],
-  incoming: McpxSession["metadata"],
-): McpxSession["metadata"] {
+function mergeMetadata(props: {
+  current: McpxSession["metadata"];
+  incoming: McpxSession["metadata"];
+}): McpxSession["metadata"] {
+  const { current, incoming } = props;
   const mergedLlm =
     incoming.llm && current.llm
       ? {

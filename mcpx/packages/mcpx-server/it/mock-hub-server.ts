@@ -2,7 +2,7 @@ import { Server, Socket } from "socket.io";
 import { createServer, Server as HttpServer } from "http";
 import { Logger } from "winston";
 import {
-  McpxBoundPayloads,
+  mcpxBoundPayloads,
   SetIdentityPayload,
   savedSetupItemSchema,
   MCPX_BOUND_EVENTS,
@@ -19,11 +19,13 @@ import {
   discardSkillDraftPayloadSchema,
   SkillWriteAck,
   DeleteSkillAck,
+  HUB_SOCKET_MAX_MESSAGE_BYTES,
 } from "@mcpx/webapp-protocol/messages";
 
 import { Skill, SkillWithDraft } from "@mcpx/shared-model";
 import z from "zod/v4";
 import { v7 as uuidv7 } from "uuid";
+import { createRequestHold, RequestHold } from "./request-hold.js";
 
 // The real Hub stamps the connecting owner as the author; mirror that.
 function skillAuthorOf(socket: Socket): {
@@ -37,10 +39,10 @@ function skillAuthorOf(socket: Socket): {
   };
 }
 
-export type SetCatalogPayload = z.input<typeof McpxBoundPayloads.setCatalog>;
+export type SetCatalogPayload = z.input<typeof mcpxBoundPayloads.setCatalog>;
 export type SavedSetupItem = z.infer<typeof savedSetupItemSchema>;
 export type SetMcpxBehaviorPayload = z.input<
-  typeof McpxBoundPayloads.setMcpxBehavior
+  typeof mcpxBoundPayloads.setMcpxBehavior
 >;
 
 export interface MockHubServerOptions {
@@ -65,6 +67,8 @@ export class MockHubServer {
   private setupChangeResolvers: ((message: unknown) => void)[] = [];
   private toolCallBatchMessages: unknown[] = [];
   private toolCallBatchResolvers: ((message: unknown) => void)[] = [];
+  private usageStatsMessages: unknown[] = [];
+  private usageStatsResolvers: ((message: unknown) => void)[] = [];
   private catalogPayload: SetCatalogPayload | undefined;
   private identityPayload: SetIdentityPayload;
   private behaviorPayload: SetMcpxBehaviorPayload | undefined;
@@ -75,6 +79,7 @@ export class MockHubServer {
     new Map();
   // OAuth tokens, verifiers and client info, keyed by "<serverName>:<tokenType>".
   private oauthTokens: Map<string, unknown> = new Map();
+  private tokenLoadHolds: (() => Promise<void>)[] = [];
   private dynamicCapabilitiesResponse: DynamicCapabilitiesMatchingAck = {
     success: true,
     result: { tools: [] },
@@ -95,6 +100,7 @@ export class MockHubServer {
     this.httpServer = createServer();
     this.io = new Server(this.httpServer, {
       path: "/v1/ws",
+      maxHttpBufferSize: HUB_SOCKET_MAX_MESSAGE_BYTES,
       cors: {
         origin: "*",
         methods: ["GET", "POST"],
@@ -129,6 +135,13 @@ export class MockHubServer {
   /** Pre-load tokens a previous MCPX instance saved, to simulate a pod restart. */
   seedOAuthTokens(tokens: Map<string, unknown>): void {
     tokens.forEach((data, key) => this.oauthTokens.set(key, data));
+  }
+
+  /** Hold the next token load; on release it answers with the tokens stored then. */
+  holdNextTokenLoad(): RequestHold {
+    const { hold, wait } = createRequestHold();
+    this.tokenLoadHolds.push(wait);
+    return hold;
   }
 
   /** Emit catalog to all connected clients. Useful after subscribing to ensure catalog is received. */
@@ -319,6 +332,34 @@ export class MockHubServer {
     });
   }
 
+  getUsageStatsMessages(): unknown[] {
+    return this.usageStatsMessages;
+  }
+
+  waitForUsageStats(timeoutMs: number = 5000): Promise<unknown> {
+    if (this.usageStatsMessages.length > 0) {
+      return Promise.resolve(
+        this.usageStatsMessages[this.usageStatsMessages.length - 1],
+      );
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        const index = this.usageStatsResolvers.indexOf(resolve);
+        if (index > -1) {
+          this.usageStatsResolvers.splice(index, 1);
+        }
+        reject(new Error("Timeout waiting for usage-stats message"));
+      }, timeoutMs);
+
+      const wrappedResolve = (message: unknown) => {
+        clearTimeout(timeoutId);
+        resolve(message);
+      };
+      this.usageStatsResolvers.push(wrappedResolve);
+    });
+  }
+
   async waitForListening(): Promise<void> {
     return this.listeningPromise;
   }
@@ -487,6 +528,13 @@ export class MockHubServer {
         this.toolCallBatchMessages.push(envelope);
         this.toolCallBatchResolvers.forEach((resolver) => resolver(envelope));
         this.toolCallBatchResolvers = [];
+      });
+
+      socket.on(WEBAPP_BOUND_EVENTS.USAGE_STATS, (envelope: unknown) => {
+        this.logger.info("Received usage-stats", { socketId: socket.id });
+        this.usageStatsMessages.push(envelope);
+        this.usageStatsResolvers.forEach((resolver) => resolver(envelope));
+        this.usageStatsResolvers = [];
       });
 
       socket.on("setup-change", (envelope: unknown) => {
@@ -890,11 +938,12 @@ export class MockHubServer {
 
       socket.on(
         WEBAPP_BOUND_EVENTS.LOAD_OAUTH_TOKEN,
-        (
+        async (
           envelope: { payload: { serverName: string; tokenType: string } },
           ack: (res: { success: boolean; data?: unknown }) => void,
         ) => {
           const { serverName, tokenType } = envelope.payload;
+          await this.tokenLoadHolds.shift()?.();
           ack({
             success: true,
             data: this.oauthTokens.get(`${serverName}:${tokenType}`),
