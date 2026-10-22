@@ -396,8 +396,8 @@ describe("SavedSetups", () => {
 
     it("does not save on Enter key when description has invalid characters", async () => {
       const user = userEvent.setup();
-      const mutation = { mutate: vi.fn(), isPending: false } as never;
-      vi.mocked(useSaveSetup).mockReturnValue(mutation);
+      const mutation = { mutate: vi.fn(), isPending: false };
+      vi.mocked(useSaveSetup).mockReturnValue(mutation as never);
 
       renderPage();
 
@@ -417,8 +417,8 @@ describe("SavedSetups", () => {
 
     it("saves on Enter key when description is valid", async () => {
       const user = userEvent.setup();
-      const mutation = { mutate: vi.fn(), isPending: false } as never;
-      vi.mocked(useSaveSetup).mockReturnValue(mutation);
+      const mutation = { mutate: vi.fn(), isPending: false };
+      vi.mocked(useSaveSetup).mockReturnValue(mutation as never);
 
       renderPage();
 

@@ -20,7 +20,12 @@ import {
   BehaviorServiceI,
   HubSourcedMcpxBehaviors,
 } from "../src/services/behavior-service.js";
-import { McpxBehaviorSettings } from "@mcpx/webapp-protocol/messages";
+import {
+  HUB_SOCKET_MAX_MESSAGE_BYTES,
+  McpxBehaviorSettings,
+  WebappBoundPayloadOf,
+  wrapInEnvelope,
+} from "@mcpx/webapp-protocol/messages";
 
 // Minimal test doubles for dependencies not relevant to Hub connection tests
 class StubSetupManager implements SetupManagerI {
@@ -155,10 +160,24 @@ class StubTargetClients
     _hookName: string,
     _hook: (servers: TargetServer[]) => void,
   ) {}
-  async initiateOAuthForServer() {
+  private initiationWaiters: Array<(initiation: OAuthInitiation) => void> = [];
+
+  async initiateOAuthForServer(serverName: string, callbackUrl?: string) {
+    this.initiationWaiters
+      .splice(0)
+      .forEach((resolve) => resolve({ serverName, callbackUrl }));
     return { authorizationUrl: "", state: "", userCode: undefined };
   }
-  async completeOAuthByState() {}
+
+  // Register before emitting, so the call can't slip past the waiter.
+  waitForInitiation(): Promise<OAuthInitiation> {
+    return new Promise((resolve) => this.initiationWaiters.push(resolve));
+  }
+}
+
+interface OAuthInitiation {
+  serverName: string;
+  callbackUrl?: string;
 }
 
 // Resolves once the service reaches `target` status (or rejects on timeout).
@@ -344,6 +363,67 @@ describe("HubService", () => {
       // A refused connection surfaces as unavailable.
       await waitForConnectionError(hubService, "HubUnavailableError", 5000);
       expect(hubService.status.status).toBe("unauthenticated");
+    });
+  });
+
+  describe("initiate-oauth", () => {
+    const MCPX_CALLBACK = "https://mcpx.example.com/auth/callback";
+
+    it("initiates with the MCPX callback URL", async () => {
+      mockHubServer.setValidTokens([VALID_USER_ID]);
+      hubService = makeHub({
+        connectionTimeout: 5000,
+        oauthCallbackUrl: MCPX_CALLBACK,
+      });
+      await hubService.connect({ setupOwnerId: VALID_USER_ID });
+      await waitForStatus(hubService, "authenticated", 5000);
+      const [socketId] = mockHubServer.getConnectedClients();
+      if (!socketId) {
+        throw new Error("Hub client did not connect");
+      }
+      const initiation = stubTargetClients.waitForInitiation();
+
+      mockHubServer.emitToClient(
+        socketId,
+        "initiate-oauth",
+        wrapInEnvelope({ payload: { serverName: "github" } }),
+      );
+
+      expect(await initiation).toEqual({
+        serverName: "github",
+        callbackUrl: MCPX_CALLBACK,
+      });
+    });
+
+    it("ignores a callbackUrl sent on the wire", async () => {
+      mockHubServer.setValidTokens([VALID_USER_ID]);
+      hubService = makeHub({
+        connectionTimeout: 5000,
+        oauthCallbackUrl: MCPX_CALLBACK,
+      });
+      await hubService.connect({ setupOwnerId: VALID_USER_ID });
+      await waitForStatus(hubService, "authenticated", 5000);
+      const [socketId] = mockHubServer.getConnectedClients();
+      if (!socketId) {
+        throw new Error("Hub client did not connect");
+      }
+      const initiation = stubTargetClients.waitForInitiation();
+
+      mockHubServer.emitToClient(
+        socketId,
+        "initiate-oauth",
+        wrapInEnvelope({
+          payload: {
+            serverName: "github",
+            callbackUrl: "https://webserver.example.com/oauth/callback",
+          },
+        }),
+      );
+
+      expect(await initiation).toEqual({
+        serverName: "github",
+        callbackUrl: MCPX_CALLBACK,
+      });
     });
   });
 
@@ -922,5 +1002,60 @@ describe("HubService", () => {
     // microtasks/callbacks, and the server-side handler may not fire before the test
     // assertion runs — even though the data was sent. The BatchBuffer unit test covers
     // the shutdown-flush logic at the pure level.
+  });
+
+  describe("Usage stats size", () => {
+    beforeEach(() => {
+      mockHubServer.setValidTokens([VALID_USER_ID]);
+    });
+
+    it("delivers usage stats bigger than the Hub's socket limit, trimmed to fit", async () => {
+      const longDescription = "x".repeat(HUB_SOCKET_MAX_MESSAGE_BYTES);
+      const getOversizedUsageStats =
+        (): WebappBoundPayloadOf<"usage-stats"> => ({
+          agents: [],
+          targetServers: [
+            {
+              name: "big-server",
+              type: "streamable-http",
+              status: "connected",
+              tools: {
+                "big-tool": {
+                  description: longDescription,
+                  isCustom: false,
+                  usage: { callCount: 3 },
+                },
+              },
+            },
+          ],
+        });
+      hubService = new HubService(
+        logger,
+        stubSetupManager,
+        stubCatalogManager,
+        stubEnvVarManager,
+        stubConfigService,
+        stubIdentityService,
+        stubBehaviorService,
+        stubTargetClients,
+        getOversizedUsageStats,
+        { hubUrl: HUB_URL, connectionTimeout: 5000 },
+      );
+      await hubService.connect({ setupOwnerId: VALID_USER_ID });
+
+      const envelope = await mockHubServer.waitForUsageStats(3000);
+      const { payload } = envelope as {
+        payload: WebappBoundPayloadOf<"usage-stats">;
+      };
+
+      const tool = payload.targetServers[0]?.tools?.["big-tool"];
+      expect(tool?.usage.callCount).toBe(3);
+      expect(tool?.description?.length).toBeLessThan(longDescription.length);
+      expect(Buffer.byteLength(JSON.stringify(envelope))).toBeLessThanOrEqual(
+        HUB_SOCKET_MAX_MESSAGE_BYTES,
+      );
+      expect(hubService.status.status).toBe("authenticated");
+      expect(mockHubServer.getConnectedClients()).toHaveLength(1);
+    });
   });
 });
