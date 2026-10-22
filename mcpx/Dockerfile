@@ -159,12 +159,15 @@ ENV DIND_ENABLED=true
 
 WORKDIR ${HOME}
 
-RUN apk add --no-cache \
-    "nodejs~=22" \
-    npm=11.6.4-r0
+# node comes from the pinned official image to retain its security fixes.
+RUN apk add --no-cache libstdc++ libgcc
+COPY --from=base /usr/local/bin/node /usr/local/bin/node
+COPY --from=base /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    npm install -g npm@11.6.4 --cache /tmp/empty-cache && \
+    rm -rf /tmp/empty-cache
 
-# replace Alpine's separately installed runtime with the pinned official binary.
-COPY --from=base /usr/local/bin/node /usr/bin/node
 ENV NODE_VERSION=22.23.4
 RUN node -e 'const assert = require("node:assert/strict"); const zlib = require("node:zlib"); assert.equal(process.version, "v22.23.4"); assert.equal(process.config.variables.node_shared_brotli, false); assert.equal(typeof zlib.constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH, "number"); const input = Buffer.from("MCPX runtime check"); assert.deepEqual(zlib.brotliDecompressSync(zlib.brotliCompressSync(input)), input);'
 
@@ -177,8 +180,8 @@ RUN apk add --no-cache \
     python3=3.12.15-r0 \
     py3-pip=25.1.1-r0 \
     uv=0.7.22-r0 \
-    ca-certificates=20260909-r0 \
-    libexpat=2.8.5-r0 \
+    ca-certificates=20261020-r0 \
+    libexpat=2.9.0-r0 \
     su-exec=0.2-r3
 
 RUN \
