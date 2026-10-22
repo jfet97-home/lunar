@@ -13,7 +13,7 @@
 #     docker build -t mcpx --target mcpx -f ./mcpx/Dockerfile .
 #     docker run --rm -p 9000:9000 -p 5173:5173 -p 3000:3000 mcpx
 
-FROM node:22.22.3-alpine3.22 AS base
+FROM node:22.23.4-alpine3.23@sha256:6abbcf5dd6b231da109bcde1181db1d92bf78015ae1a9514d9807c1f857869db AS base
 
 ENV HOME=/lunar
 
@@ -59,12 +59,12 @@ RUN npm run install:ui && npm run build:ui
 # Dev deps of the shared root are not needed at runtime
 RUN cd /ai-gateway-shared/public && npm prune --omit=dev
 
-FROM --platform=$BUILDPLATFORM node:22.22.3-alpine3.22 AS tool-embedding-model
+FROM --platform=$BUILDPLATFORM node:22.23.4-alpine3.23@sha256:6abbcf5dd6b231da109bcde1181db1d92bf78015ae1a9514d9807c1f857869db AS tool-embedding-model
 WORKDIR /lunar
 COPY mcpx/scripts/download-tool-embedding-model.mjs ./scripts/download-tool-embedding-model.mjs
 RUN node ./scripts/download-tool-embedding-model.mjs
 
-FROM node:22.22.3-alpine3.22 AS mcpx-ui
+FROM node:22.23.4-alpine3.23@sha256:6abbcf5dd6b231da109bcde1181db1d92bf78015ae1a9514d9807c1f857869db AS mcpx-ui
 ARG UI_PORT
 
 ENV LOG_LEVEL="info"
@@ -162,6 +162,11 @@ WORKDIR ${HOME}
 RUN apk add --no-cache \
     "nodejs~=22" \
     npm=11.6.4-r0
+
+# replace Alpine's separately installed runtime with the pinned official binary.
+COPY --from=base /usr/local/bin/node /usr/bin/node
+ENV NODE_VERSION=22.23.4
+RUN node -e 'const assert = require("node:assert/strict"); const zlib = require("node:zlib"); assert.equal(process.version, "v22.23.4"); assert.equal(process.config.variables.node_shared_brotli, false); assert.equal(typeof zlib.constants.BROTLI_DECODER_ERROR_FORMAT_BLOCK_SWITCH, "number"); const input = Buffer.from("MCPX runtime check"); assert.deepEqual(zlib.brotliDecompressSync(zlib.brotliCompressSync(input)), input);'
 
 # Log build platform information for debugging
 RUN echo "Building on: $BUILDPLATFORM for: $TARGETPLATFORM" && \
