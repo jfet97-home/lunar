@@ -1067,6 +1067,7 @@ describe("lazy Streamable HTTP gateway", () => {
         format: "compact",
         description: "Create a Jira issue",
         annotations: { destructiveHint: false },
+        required: ["id"],
         inputType:
           '{ /** Project key */ project: string; type: "Bug" | "Task"; fields?: { labels?: string[]; [key: string]: unknown } }',
         complete: false,
@@ -2309,6 +2310,7 @@ describe("Code Mode on the gateway endpoints", () => {
             name: ALLOWED_NAME,
             format: "compact",
             description: `Read ${ALLOWED_NAME}`,
+            required: ["id"],
             inputType: "{ id: string }",
             complete: true,
           },
@@ -2316,6 +2318,7 @@ describe("Code Mode on the gateway endpoints", () => {
             name: "newsrv__lookup",
             format: "compact",
             description: "Read newsrv__lookup",
+            required: ["id"],
             inputType: "{ id: string }",
             complete: true,
           },
