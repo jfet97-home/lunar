@@ -68,7 +68,7 @@ mcpx_get_tool_schema({"name": "jira__create_issue", "format": "compact"})
 | `title`, `description` | Present when the tool has them, cut to 300 characters. A cut text ends with `...`.           |
 | `annotations`          | The upstream hints, as in search results.                                                    |
 | `inputType`            | A TypeScript-like type of the `arguments` object.                                            |
-| `complete`             | `true` only when `inputType` leaves out no validation keyword of the input schema.           |
+| `complete`             | `true` only when `inputType` accepts the same arguments as the input schema; see below.      |
 | `omitted`              | Present when `complete` is `false`: the keywords and cuts that `inputType` does not include. |
 
 `inputType` shows property names, `?` for optional properties, types, nested
@@ -76,25 +76,44 @@ objects and arrays, enums and constants, unions (`anyOf`, `oneOf`),
 intersections (`allOf`, and keywords next to a `$ref`), nullable values,
 records (`additionalProperties`), tuples, and references inside the same
 schema. Property descriptions appear as comments, cut to 100 characters.
-`integer` shows as `number`. An object lists only its declared properties even
-when its schema accepts others, and `oneOf` shows as an ordinary union.
+`integer` shows as `number`, and `{}` is an object without declared properties.
+An enum or const value that the sibling `type` rejects is left out.
+
+An object type lists its declared properties. `[key: string]: T` gives the type
+of any other property, and a required property that is not declared has that
+type, or `never` when the schema rejects other properties. Without an index
+signature, the type does not say whether the schema accepts undeclared
+properties, and `complete` does not depend on it. A tuple shows `minItems` and
+`maxItems` with required and optional elements and a rest element, as in
+`[string, number?, ...boolean[]]`.
+
+`complete` is `false` whenever `inputType` could accept a value that the schema
+rejects, or reject one that it accepts. For example, a `oneOf` shows as a union
+only when no value can match two of its alternatives: alternatives of different
+types, distinct literals, or objects with distinct literal values of a required
+property. Otherwise `omitted` lists `oneOf`, because a value that matches two
+alternatives fails the schema but not the union.
 
 `omitted` names each keyword that the type cannot express, such as
 `minLength`, `pattern`, `format`, `minimum` or `integer`, and the reason for
 each cut:
 
-| Label                               | Meaning                                                                                                                   |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
-| `depth limit`                       | A part nested deeper than 20 levels shows as `unknown`. Each `$ref`, `anyOf`, `oneOf` and `allOf` step counts as a level. |
-| `size limit`                        | The summary reached about 4,000 characters or 500 schema nodes. Later parts show as `unknown` or `/* +N more */`.         |
-| `recursive $ref`, `unresolved $ref` | A reference back into itself, or to anything outside this schema, shows as `unknown`.                                     |
-| `enum`, `const`                     | Values after the first 20, longer than 80 characters, or other than a string, number, boolean or null are not shown.      |
-| `long property name`                | A property name longer than 128 characters is not shown.                                                                  |
-| `invalid schema`                    | A part that is not a schema shows as `unknown`.                                                                           |
+| Label                               | Meaning                                                                                                                                                                     |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `depth limit`                       | A part nested deeper than 20 levels shows as `unknown`. Each `$ref`, `anyOf`, `oneOf` and `allOf` step counts as a level.                                                   |
+| `size limit`                        | The summary reached about 4,000 characters or 500 schema nodes, or an object has over 1,000 properties or required names. Later parts show as `unknown` or `/* +N more */`. |
+| `recursive $ref`, `unresolved $ref` | A reference back into itself, to anything outside this schema, or inside a nested `$id`, shows as `unknown`.                                                                |
+| `enum`, `const`                     | At most 20 values from the first 1,000 entries are shown, and none longer than 80 characters or other than a string, number, boolean or null.                               |
+| `oneOf`                             | A value can match more than one alternative. The schema rejects such a value, but the union accepts it.                                                                     |
+| `additionalProperties`              | An object that rejects or types undeclared properties is combined with a part that adds other properties.                                                                   |
+| `missing type`                      | A schema without `type` also accepts values other than the object or array that it shows.                                                                                   |
+| `long property name`                | A property name longer than 128 characters is not shown.                                                                                                                    |
+| `invalid schema`                    | A part that is not a schema shows as `unknown`.                                                                                                                             |
 
 At most 16 labels are listed; a final `...` means that there are more. A
 reference that occurs more than once is expanded once and reused, and each
-repetition counts toward the size limit.
+repetition counts toward the size limit. `inputType` is never longer than 5,000
+characters: a longer summary becomes `unknown` with `size limit`.
 
 Use the compact view to orient yourself: to compare similar tools, to see
 which arguments are required, or to write a call with simple arguments. Get

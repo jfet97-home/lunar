@@ -1,7 +1,33 @@
+import ts from "typescript";
 import { compactInputType } from "./compact-schema.js";
 
 // the renderer stops near its 4,000-character budget
 const MAX_INPUT_TYPE_CHARS = 4_500;
+// no summary is longer, whatever the schema
+const HARD_MAX_CHARS = 5_000;
+
+// an array that counts how many of its entries the renderer reads
+function counted<T>(entries: T[]): { list: T[]; reads: () => number } {
+  let reads = 0;
+  const list = new Proxy(entries, {
+    get(target, key, receiver) {
+      if (typeof key === "string" && /^\d+$/.test(key)) reads += 1;
+      return Reflect.get(target, key, receiver);
+    },
+  });
+  return { list, reads: () => reads };
+}
+
+function expectTypeSyntax(inputType: string): void {
+  const { diagnostics = [] } = ts.transpileModule(`type T = ${inputType};`, {
+    reportDiagnostics: true,
+  });
+  expect(
+    diagnostics.map((diagnostic) =>
+      ts.flattenDiagnosticMessageText(diagnostic.messageText, "\n"),
+    ),
+  ).toEqual([]);
+}
 
 describe("compact input type", () => {
   it("renders requiredness, types, descriptions and enums of a simple schema", () => {
@@ -61,11 +87,13 @@ describe("compact input type", () => {
             type: "array",
             prefixItems: [{ type: "string" }, { type: "number" }],
             items: false,
+            minItems: 2,
           },
           rest: {
             type: "array",
             items: [{ type: "string" }],
             additionalItems: { type: "boolean" },
+            minItems: 1,
           },
           labels: { type: "object", additionalProperties: { type: "string" } },
           meta: { type: "object", additionalProperties: true },
@@ -132,6 +160,251 @@ describe("compact input type", () => {
         "alias?: { id: string } }",
       complete: false,
       omitted: ["maxLength"],
+    });
+  });
+
+  it("flags oneOf alternatives that can overlap and keeps exclusive ones complete", () => {
+    const string = { type: "string" };
+    for (const oneOf of [
+      [string, string],
+      [
+        { type: "object", properties: { a: string } },
+        { type: "object", properties: { b: string } },
+      ],
+      [{ type: "integer" }, { type: "number" }],
+    ]) {
+      expect(compactInputType({ oneOf }).omitted).toContain("oneOf");
+    }
+    // a value that matches true and another alternative is rejected
+    expect(compactInputType({ oneOf: [string, true] })).toEqual({
+      inputType: "unknown",
+      complete: false,
+      omitted: ["oneOf"],
+    });
+
+    expect(
+      compactInputType({
+        oneOf: [string, { type: "number" }, { type: "null" }],
+      }),
+    ).toEqual({ inputType: "string | number | null", complete: true });
+    expect(
+      compactInputType({
+        oneOf: [{ const: "a" }, { const: "b" }, { enum: [1, 2] }],
+      }),
+    ).toEqual({ inputType: '"a" | "b" | 1 | 2', complete: true });
+    expect(
+      compactInputType({
+        $defs: {
+          Base: {
+            type: "object",
+            properties: { id: string },
+            required: ["id"],
+          },
+        },
+        oneOf: ["a", "b"].map((kind) => ({
+          allOf: [
+            { $ref: "#/$defs/Base" },
+            { properties: { kind: { const: kind } }, required: ["kind"] },
+          ],
+        })),
+      }),
+    ).toEqual({
+      inputType:
+        '{ id: string } & { kind: "a" } | { id: string } & { kind: "b" }',
+      complete: true,
+    });
+    // the sibling type rules out the values that typeless alternatives share
+    expect(
+      compactInputType({
+        type: "object",
+        oneOf: ["a", "b"].map((kind) => ({
+          properties: { kind: { const: kind } },
+          required: ["kind"],
+        })),
+      }),
+    ).toEqual({
+      inputType: '({ kind: "a" } | { kind: "b" }) & {}',
+      complete: true,
+    });
+  });
+
+  it("renders tuple lengths from minItems, maxItems and the items after them", () => {
+    const string = { type: "string" };
+    const number = { type: "number" };
+    const tuple = (schema: Record<string, unknown>) =>
+      compactInputType({ type: "array", ...schema });
+    for (const [schema, inputType] of [
+      [{ prefixItems: [string] }, "[string?, ...unknown[]]"],
+      [{ prefixItems: [string, number], items: false }, "[string?, number?]"],
+      [
+        { prefixItems: [string, number], items: false, minItems: 1 },
+        "[string, number?]",
+      ],
+      [
+        { prefixItems: [string, number], minItems: 2, maxItems: 2 },
+        "[string, number]",
+      ],
+      [
+        { items: [string, number], minItems: 2, maxItems: 2 },
+        "[string, number]",
+      ],
+      [
+        { prefixItems: [string, number, { type: "boolean" }], maxItems: 2 },
+        "[string?, number?]",
+      ],
+      [
+        {
+          prefixItems: [string, { anyOf: [string, number] }],
+          items: { type: "boolean" },
+          minItems: 1,
+        },
+        "[string, (string | number)?, ...boolean[]]",
+      ],
+    ] as const) {
+      expect(tuple(schema)).toEqual({ inputType, complete: true });
+    }
+    // bounds that a tuple type cannot show are reported
+    expect(tuple({ prefixItems: [string], minItems: 2 })).toEqual({
+      inputType: "[string?, ...unknown[]]",
+      complete: false,
+      omitted: ["minItems"],
+    });
+    expect(tuple({ prefixItems: [string], maxItems: 3 })).toEqual({
+      inputType: "[string?, ...unknown[]]",
+      complete: false,
+      omitted: ["maxItems"],
+    });
+    expect(tuple({ items: string, minItems: 1 })).toEqual({
+      inputType: "string[]",
+      complete: false,
+      omitted: ["minItems"],
+    });
+  });
+
+  it("applies the sibling type to literals and empty intersections", () => {
+    for (const [schema, inputType] of [
+      [{ type: "number", enum: ["x", 1] }, "1"],
+      [{ type: "integer", enum: [1, 1.5, "a"] }, "1"],
+      [{ type: ["string", "null"], enum: ["a", null, 2] }, '"a" | null'],
+      [{ type: "string", const: 1 }, "never"],
+      [{ type: "string", allOf: [{ type: "number" }] }, "never"],
+      [{ allOf: [{ enum: ["a"] }, { enum: ["b"] }] }, "never"],
+    ] as const) {
+      expect(compactInputType(schema)).toEqual({ inputType, complete: true });
+    }
+    expect(compactInputType({ const: "a", enum: ["b"] })).toEqual({
+      inputType: '"a"',
+      complete: false,
+      omitted: ["enum"],
+    });
+    expect(compactInputType({ type: "date", enum: ["a"] })).toEqual({
+      inputType: '"a"',
+      complete: false,
+      omitted: ["type"],
+    });
+  });
+
+  it("flags a closed object combined with properties that it rejects", () => {
+    const string = { type: "string" };
+    const $defs = {
+      Person: {
+        type: "object",
+        properties: { id: string },
+        required: ["id"],
+        additionalProperties: false,
+      },
+    };
+    for (const owner of [
+      { $ref: "#/$defs/Person", properties: { team: string } },
+      { $ref: "#/$defs/Person", required: ["team"] },
+      {
+        allOf: [
+          { $ref: "#/$defs/Person" },
+          { type: "object", additionalProperties: { type: "number" } },
+        ],
+      },
+    ]) {
+      expect(
+        compactInputType({ $defs, type: "object", properties: { owner } })
+          .omitted,
+      ).toEqual(["additionalProperties"]);
+    }
+
+    expect(
+      compactInputType({
+        type: "object",
+        properties: {
+          either: {
+            type: "object",
+            properties: { id: string, url: string },
+            additionalProperties: false,
+            anyOf: [{ required: ["id"] }, { required: ["url"] }],
+          },
+          // an undeclared required name takes the additionalProperties type
+          closed: {
+            type: "object",
+            properties: { a: string },
+            required: ["token"],
+            additionalProperties: false,
+          },
+          counts: {
+            type: "object",
+            required: ["total"],
+            additionalProperties: { type: "number" },
+          },
+        },
+      }),
+    ).toEqual({
+      inputType:
+        "{ either?: ({ id: unknown } | { url: unknown }) & { id?: string; url?: string }; " +
+        "closed?: { a?: string; token: never }; " +
+        "counts?: { total: number; [key: string]: number } }",
+      complete: true,
+    });
+  });
+
+  it("flags object and array keywords without a type that leave other values open", () => {
+    expect(
+      compactInputType({
+        type: "object",
+        properties: {
+          a: { properties: { b: { type: "string" } } },
+          c: { items: { type: "string" } },
+        },
+      }),
+    ).toEqual({
+      inputType: "{ a?: { b?: string }; c?: string[] }",
+      complete: false,
+      omitted: ["missing type"],
+    });
+    // a sibling type limits the values to objects
+    expect(
+      compactInputType({
+        type: "object",
+        properties: { a: { type: "string" } },
+        allOf: [{ required: ["a"] }],
+      }),
+    ).toEqual({ inputType: "{ a: unknown } & { a?: string }", complete: true });
+  });
+
+  it("leaves references inside a nested $id unresolved", () => {
+    expect(
+      compactInputType({
+        $defs: { Name: { type: "string" } },
+        type: "object",
+        properties: {
+          inner: {
+            $id: "https://example.com/inner",
+            type: "object",
+            properties: { name: { $ref: "#/$defs/Name" } },
+          },
+          outer: { $ref: "#/$defs/Name" },
+        },
+      }),
+    ).toEqual({
+      inputType: "{ inner?: { name?: unknown }; outer?: string }",
+      complete: false,
+      omitted: ["$id", "unresolved $ref"],
     });
   });
 
@@ -422,6 +695,138 @@ describe("compact input type", () => {
     expect(keywords.omitted).toHaveLength(17);
     expect(keywords.omitted?.[0]).toBe(`${"k".repeat(64)}...`);
     expect(keywords.omitted?.at(-1)).toBe("...");
+  });
+
+  it("bounds the work on long lists by its limits, not by their length", () => {
+    const wide = 60_000;
+    const inProperty = (schema: unknown) =>
+      compactInputType({ type: "object", properties: { v: schema } });
+
+    // boolean members are schema nodes too
+    for (const [member, inputType] of [
+      [false, "never"],
+      [true, "unknown"],
+      [{ type: "string" }, "string"],
+    ] as const) {
+      const members = counted(Array(wide).fill(member));
+      expect(inProperty({ allOf: members.list })).toEqual({
+        inputType: `{ v?: ${inputType} }`,
+        complete: false,
+        omitted: ["size limit"],
+      });
+      expect(members.reads()).toBeLessThanOrEqual(500);
+    }
+
+    const lists: [(list: unknown[]) => unknown, unknown, string, number][] = [
+      [(list) => ({ anyOf: list }), { type: "string" }, "size limit", 500],
+      [(list) => ({ type: list }), "string", "type", 0],
+      [(list) => ({ enum: list }), { a: 1 }, "enum", 1_000],
+      [(list) => ({ type: "number", enum: list }), "x", "enum", 1_000],
+      [(list) => ({ type: "object", required: list }), "a", "size limit", 0],
+    ];
+    for (const [schema, entry, label, limit] of lists) {
+      const entries = counted(Array(wide).fill(entry));
+      expect(inProperty(schema(entries.list))).toEqual({
+        inputType: "{ v?: unknown }",
+        complete: false,
+        omitted: [label],
+      });
+      expect(entries.reads()).toBeLessThanOrEqual(limit);
+    }
+
+    const elements = counted(Array(wide).fill({ type: "string" }));
+    const tuple = inProperty({ type: "array", prefixItems: elements.list });
+    expect(tuple.omitted).toEqual(["size limit"]);
+    expect(tuple.inputType).toMatch(/string\?, \.\.\.unknown\[\]\] }$/);
+    expect(tuple.inputType.length).toBeLessThanOrEqual(HARD_MAX_CHARS);
+    expect(elements.reads()).toBeLessThanOrEqual(500);
+
+    const longNames = compactInputType({
+      type: "object",
+      properties: Object.fromEntries(
+        Array.from({ length: wide }, (_, index) => [
+          `${"n".repeat(128)}${index}`,
+          { type: "string" },
+        ]),
+      ),
+    });
+    expect(longNames).toEqual({
+      inputType: `{ /* +${wide} more */ }`,
+      complete: false,
+      omitted: ["long property name", "size limit"],
+    });
+
+    const startedAt = Date.now();
+    const keywords = compactInputType({
+      type: "object",
+      ...Object.fromEntries(
+        Array.from({ length: wide }, (_, index) => [
+          `${index}${"k".repeat(1_000)}`,
+          true,
+        ]),
+      ),
+    });
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(keywords.omitted).toHaveLength(17);
+    expect(keywords.omitted?.at(-1)).toBe("...");
+  });
+
+  it("keeps cut output well-formed and within a hard limit", () => {
+    const fields = Object.fromEntries(
+      Array.from({ length: 500 }, (_, index) => [
+        `field${index}`,
+        { type: "string" },
+      ]),
+    );
+    // the budget runs out before the first tuple element
+    const cut = compactInputType({
+      type: "array",
+      allOf: [{ type: "array", items: { type: "object", properties: fields } }],
+      prefixItems: [{ type: "string" }, { type: "string" }],
+      items: { type: "number" },
+    });
+    expect(cut.omitted).toEqual(["size limit"]);
+    expect(cut.inputType).toMatch(
+      / \/\* \+\d+ more \*\/ }\[\] & \[\.\.\.unknown\[\]\]$/,
+    );
+    expectTypeSyntax(cut.inputType);
+
+    // each level adds closing text after the budget runs out
+    const nest = (levels: number): Record<string, unknown> => {
+      let schema: Record<string, unknown> = { type: "string" };
+      for (let level = 0; level < levels; level += 1) {
+        schema = {
+          type: ["object", "array", "null", "string", "number", "boolean"],
+          nullable: true,
+          anyOf: [{ type: "object" }, { type: "array" }],
+          properties: {
+            ["x".repeat(127) + "-"]: {
+              ...schema,
+              description: "d".repeat(300),
+            },
+            ...Object.fromEntries(
+              Array.from({ length: 30 }, (_, index) => [
+                `s${index}`,
+                { type: "string", description: "e".repeat(300) },
+              ]),
+            ),
+          },
+        };
+      }
+      return schema;
+    };
+    expect(compactInputType(nest(30))).toEqual({
+      inputType: "unknown",
+      complete: false,
+      omitted: ["size limit"],
+    });
+    for (const levels of [2, 5, 8]) {
+      const { inputType, omitted } = compactInputType(nest(levels));
+      expect(omitted).toContain("size limit");
+      expect(inputType.length).toBeGreaterThan(3_600);
+      expect(inputType.length).toBeLessThanOrEqual(HARD_MAX_CHARS);
+      expectTypeSyntax(inputType);
+    }
   });
 
   it("renders a schema that is missing or not an object conservatively", () => {
