@@ -1380,8 +1380,17 @@ describe("Code Mode on the gateway endpoints", () => {
       ]);
       expect(catalogNames).toContain("mcpx_execute_readonly");
       for (const { client } of [catalog, lazy]) {
-        expect(client.getInstructions()).toContain("mcpx_execute");
-        expect(client.getInstructions()).toContain("mcpx_execute_readonly");
+        const instructions = client.getInstructions();
+        expect(instructions).toContain(
+          "direct tool calls for a single small lookup",
+        );
+        expect(instructions).toContain(
+          "a chain of calls or a large response you can filter, use mcpx_execute",
+        );
+        expect(instructions).toContain("use mcpx_execute_readonly");
+        expect(instructions).toContain(
+          "mcpx.searchTools(query, { readOnly: true })",
+        );
         const readOnlyTool = (await client.listTools()).tools.find(
           (tool) => tool.name === "mcpx_execute_readonly",
         );
