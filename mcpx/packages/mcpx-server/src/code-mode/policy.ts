@@ -1,4 +1,5 @@
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import { CODE_MODE_RESERVED_TOOL_NAMES } from "./tool.js";
 
 export interface CodeModeLimits {
   cpuMs: number;
@@ -130,6 +131,34 @@ export function classifyReadOnlyCall(
   return classification.kind === "trusted-read"
     ? classification
     : { kind: "blocked", reason: "not-trusted" };
+}
+
+/*
+ * Whether mcpx_execute_readonly would run a visible tool now, as reported by
+ * discovery: the same reserved names and classifyReadOnlyCall that execution
+ * applies. `unavailable` means the gateway cannot run read-only scripts.
+ * Discovery only informs; every call is classified again when it runs.
+ */
+export type ReadOnlyEligibility =
+  | { eligible: true }
+  | {
+      eligible: false;
+      reason: "declares_write" | "not_trusted" | "reserved" | "unavailable";
+    };
+
+export function readOnlyEligibility(
+  props: Parameters<typeof classifyToolCall>[0],
+): ReadOnlyEligibility {
+  if (CODE_MODE_RESERVED_TOOL_NAMES.has(props.name)) {
+    return { eligible: false, reason: "reserved" };
+  }
+  const decision = classifyReadOnlyCall(props);
+  if (decision.kind === "trusted-read") return { eligible: true };
+  return {
+    eligible: false,
+    reason:
+      decision.reason === "declares-write" ? "declares_write" : "not_trusted",
+  };
 }
 
 // Anchored match where `*` is the only wildcard; every other character is literal.

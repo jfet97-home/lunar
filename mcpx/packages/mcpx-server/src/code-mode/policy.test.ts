@@ -3,6 +3,7 @@ import {
   classifyReadOnlyCall,
   classifyToolCall,
   matchesPattern,
+  readOnlyEligibility,
 } from "./policy.js";
 
 function tool(annotations?: Tool["annotations"]): Tool {
@@ -186,6 +187,56 @@ describe("Code Mode side-effect policy", () => {
       kind: "blocked",
       reason: "not-trusted",
     });
+  });
+
+  it("reports discovery eligibility as the read-only decision plus reserved names", () => {
+    const trust = {
+      trustedReadTools: ["docs__get_page", "docs__delete_page", "docs__*"],
+      trustedAnnotationServers: ["kb"],
+    };
+    const cases: [string, Tool["annotations"], "internal" | "upstream"][] = [
+      ["mcpx__management_list_servers", { readOnlyHint: true }, "internal"],
+      ["docs__get_page", undefined, "upstream"],
+      ["docs__delete_page", { destructiveHint: true }, "upstream"],
+      ["docs__purge", undefined, "upstream"],
+      ["kb__read", { readOnlyHint: true }, "upstream"],
+      ["kb__write", { readOnlyHint: false }, "upstream"],
+      ["wiki__read", { readOnlyHint: true }, "upstream"],
+    ];
+    const reported = cases.map(([name, annotations, origin]) => {
+      const props = {
+        name,
+        serverName: name.split("__")[0] ?? "",
+        origin,
+        definition: tool(annotations),
+        trust,
+      };
+      // the same decision mcpx_execute_readonly makes before dispatch
+      const decision = classifyReadOnlyCall(props);
+      const eligibility = readOnlyEligibility(props);
+      expect(eligibility.eligible).toBe(decision.kind === "trusted-read");
+      return [name, eligibility];
+    });
+    expect(Object.fromEntries(reported)).toEqual({
+      mcpx__management_list_servers: { eligible: true },
+      docs__get_page: { eligible: true },
+      docs__delete_page: { eligible: false, reason: "declares_write" },
+      docs__purge: { eligible: false, reason: "not_trusted" },
+      kb__read: { eligible: true },
+      kb__write: { eligible: false, reason: "declares_write" },
+      wiki__read: { eligible: false, reason: "not_trusted" },
+    });
+    for (const name of ["mcpx_execute_readonly", "mcpx_call_tool"]) {
+      expect(
+        readOnlyEligibility({
+          name,
+          serverName: "mcpx",
+          origin: "internal",
+          definition: tool({ readOnlyHint: true }),
+          trust: { trustedReadTools: [name], trustedAnnotationServers: [] },
+        }),
+      ).toEqual({ eligible: false, reason: "reserved" });
+    }
   });
 
   it("matches anchored patterns with literal punctuation", () => {

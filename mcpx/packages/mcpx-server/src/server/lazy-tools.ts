@@ -4,6 +4,7 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import z from "zod/v4";
+import { ReadOnlyEligibility } from "../code-mode/policy.js";
 
 const MAX_RESULTS = 20;
 const MAX_DESCRIPTION_LENGTH = 300;
@@ -26,6 +27,7 @@ const searchSchema = z
     query: z.string().trim().min(1).max(500),
     limit: z.number().int().min(1).max(MAX_RESULTS).default(5),
     offset: z.number().int().min(0).default(0),
+    readOnly: z.boolean().default(false),
   })
   .strict();
 const nameSchema = z.object({ name: z.string().min(1).max(500) }).strict();
@@ -54,7 +56,7 @@ export const LAZY_TOOLS: Tool[] = [
   {
     name: "mcpx_search_tools",
     description:
-      "Find tools by keywords or exact name. Returns a small shortlist without schemas. Search for a service and task, then use mcpx_get_tool_schema for the selected name. Use offset to browse more matches.",
+      "Find tools by keywords or exact name. Returns a small shortlist without schemas. Search for a service and task, then use mcpx_get_tool_schema for the selected name. Use offset to browse more matches. Each result's readOnlyEligibility is the gateway's decision whether mcpx_execute_readonly would run that tool now, with a reason when it would not; annotations are the upstream's own hints.",
     inputSchema: {
       type: "object",
       properties: {
@@ -66,6 +68,12 @@ export const LAZY_TOOLS: Tool[] = [
           default: 5,
         },
         offset: { type: "integer", minimum: 0, default: 0 },
+        readOnly: {
+          type: "boolean",
+          default: false,
+          description:
+            "Return only tools that mcpx_execute_readonly would run now; totalMatches and nextOffset count only those. Every call is still checked when it runs.",
+        },
       },
       required: ["query"],
       additionalProperties: false,
@@ -114,7 +122,7 @@ export const LAZY_TOOLS: Tool[] = [
 ];
 
 export const LAZY_INSTRUCTIONS =
-  "MCPX is a gateway to multiple MCP servers. At the start of a session, call mcpx_list_servers immediately to learn the available server names and descriptions. Built-in MCPX management tools are available directly when permitted; call them by their mcpx__management_* names without searching first. Upstream tools are loaded on demand. Use mcpx_search_tools with service/task keywords, mcpx_get_tool_schema for one chosen upstream tool, then mcpx_call_tool with its exact name and arguments. Search results omit schemas and are bounded; use offset for additional matches. Do not list the entire upstream catalog before starting a task.";
+  "MCPX is a gateway to multiple MCP servers. At the start of a session, call mcpx_list_servers immediately to learn which servers are available. Call permitted management tools directly by their mcpx__management_* names. For a direct upstream call, use mcpx_search_tools with service and task keywords, then load the chosen tool's schema with mcpx_get_tool_schema and invoke it with mcpx_call_tool. Search results are bounded. Use offset for additional matches.";
 
 export interface LazyManagementCapability {
   serverName: string;
@@ -153,6 +161,8 @@ export async function resolveLazyToolRequest(
   ) => rankToolsLexically(tools, query),
   listServers: () => LazyServer[] = () => [],
   directManagementToolNames: ReadonlySet<string> = new Set(),
+  // absent when this gateway cannot run read-only scripts
+  readOnlyEligibilityOf?: (tool: Tool) => ReadOnlyEligibility,
 ): Promise<LazyRequestResolution> {
   const args = request.params.arguments ?? {};
   if (request.params.name === "mcpx_list_servers") {
@@ -170,8 +180,21 @@ export async function resolveLazyToolRequest(
   if (request.params.name === "mcpx_search_tools") {
     const parsed = searchSchema.safeParse(args);
     if (!parsed.success) return invalidArguments(parsed.error.message);
-    const { query, limit, offset } = parsed.data;
-    const matches = await search(visibleTools, query);
+    const { query, limit, offset, readOnly } = parsed.data;
+    if (readOnly && !readOnlyEligibilityOf) {
+      return errorResult(
+        "mcpx_execute_readonly is not available on this gateway, so no tool is eligible for it. Search without readOnly.",
+      );
+    }
+    const eligibility = (tool: Tool): ReadOnlyEligibility =>
+      readOnlyEligibilityOf
+        ? readOnlyEligibilityOf(tool)
+        : { eligible: false, reason: "unavailable" };
+    // filter the unfiltered ranking, so eligible tools keep their relative order
+    const ranked = await search(visibleTools, query);
+    const matches = readOnly
+      ? ranked.filter((tool) => eligibility(tool).eligible)
+      : ranked;
     const tools = matches.slice(offset, offset + limit).map((tool) => {
       const annotations = projectAnnotations(tool.annotations);
       return {
@@ -181,6 +204,7 @@ export async function resolveLazyToolRequest(
           : {}),
         description: (tool.description ?? "").slice(0, MAX_DESCRIPTION_LENGTH),
         ...(annotations ? { annotations } : {}),
+        readOnlyEligibility: eligibility(tool),
       };
     });
     return jsonResult({
