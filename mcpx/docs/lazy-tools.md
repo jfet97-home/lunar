@@ -22,6 +22,8 @@ reads. See the [Code Mode guide](code-mode.md).
    default, including names, short descriptions, tool annotations, and
    [read-only eligibility](#read-only-eligibility).
 3. Call `mcpx_get_tool_schema` with one returned name to obtain its full definition.
+   Add `"format": "compact"` for a shorter summary of its arguments; see
+   [Compact schema view](#compact-schema-view).
 4. Call `mcpx_call_tool` with that name and an `arguments` object matching its
    schema. Permitted built-in management tools are advertised directly under
    names such as `mcpx__management_list_servers`; call them without search,
@@ -46,6 +48,86 @@ Search results omit argument and output schemas. `limit` is capped at 20;
 `offset` and `nextOffset` allow bounded browsing. An exact tool name selects that
 tool directly. Tool names returned by discovery are the same qualified names
 advertised by the full endpoint.
+
+## Compact schema view
+
+`mcpx_get_tool_schema` takes an optional `format`. The default, `"full"`,
+returns the tool definition exactly as before. `"compact"` returns a short
+summary that MCPX derives on request from the visible tool's `inputSchema`, so
+it works for every tool, including tools added after the session started:
+
+```text
+mcpx_get_tool_schema({"name": "jira__create_issue", "format": "compact"})
+→ {"name":"jira__create_issue","format":"compact","description":"Create a Jira issue","annotations":{"destructiveHint":false},"inputType":"{ /** Project key */ project: string; type: \"Bug\" | \"Task\"; fields?: { labels?: string[]; [key: string]: unknown } }","complete":false,"omitted":["pattern"]}
+```
+
+| Field                  | Content                                                                                      |
+| ---------------------- | -------------------------------------------------------------------------------------------- |
+| `name`                 | The exact tool name. Use it unchanged in `mcpx_call_tool`.                                   |
+| `format`               | Always `"compact"`. A full definition has no such field.                                     |
+| `title`, `description` | Present when the tool has them, cut to 300 characters. A cut text ends with `...`.           |
+| `annotations`          | The upstream hints, as in search results.                                                    |
+| `inputType`            | A TypeScript-like type of the `arguments` object.                                            |
+| `complete`             | `true` when the renderer detects no omissions in the compact view.                           |
+| `omitted`              | Present when `complete` is `false`: the keywords and cuts that `inputType` does not include. |
+
+`inputType` shows property names, `?` for optional properties, types, nested
+objects and arrays, enums and constants, unions (`anyOf`, `oneOf`),
+intersections (`allOf`, and keywords next to a `$ref`), nullable values,
+records (`additionalProperties`), tuples, and references inside the same
+schema. Property descriptions appear as comments, cut to 100 characters.
+`integer` shows as `number`, and `{}` is an object without declared properties.
+An enum or const value that the sibling `type` rejects is left out.
+
+An object type lists its declared properties. `[key: string]: T` gives the type
+of any other property, and a required property that is not declared has that
+type, or `never` when the schema rejects other properties. Without an index
+signature, the type does not say whether the schema accepts undeclared
+properties, and `complete` does not depend on it. A tuple shows `minItems` and
+`maxItems` with required and optional elements and a rest element, as in
+`[string, number?, ...boolean[]]`.
+
+`complete` reports whether the renderer detected an omitted constraint or cut.
+Use the full schema when exact validation matters. For example, a `oneOf` is
+marked incomplete unless the renderer can establish that its alternatives
+are disjoint, such as distinct literal values on a required property. A plain
+union cannot express that the schema rejects values matching two alternatives.
+Compact references use local pointers and combine sibling constraints. Use the
+full schema for dialect-specific reference behavior.
+
+`omitted` names each keyword that the type cannot express, such as
+`minLength`, `pattern`, `format`, `minimum` or `integer`, and the reason for
+each cut:
+
+| Label                               | Meaning                                                                                                                                                                     |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `depth limit`                       | A part nested deeper than 20 levels shows as `unknown`. Each `$ref`, `anyOf`, `oneOf` and `allOf` step counts as a level.                                                   |
+| `size limit`                        | The summary reached about 4,000 characters or 500 schema nodes, or an object has over 1,000 properties or required names. Later parts show as `unknown` or `/* +N more */`. |
+| `recursive $ref`, `unresolved $ref` | A reference back into itself, to anything outside this schema, or inside a nested `$id`, shows as `unknown`.                                                                |
+| `enum`, `const`                     | At most 20 values from the first 1,000 entries are shown, and none longer than 80 characters or other than a string, number, boolean or null.                               |
+| `oneOf`                             | A value can match more than one alternative. The schema rejects such a value, but the union accepts it.                                                                     |
+| `additionalProperties`              | An object that rejects or types undeclared properties is combined with a part that adds other properties.                                                                   |
+| `missing type`                      | A schema without `type` also accepts values other than the object or array that it shows.                                                                                   |
+| `long property name`                | A property name longer than 128 characters is not shown.                                                                                                                    |
+| `invalid schema`                    | A part that is not a schema shows as `unknown`.                                                                                                                             |
+
+At most 16 labels are listed; a final `...` means that there are more. A
+reference that occurs more than once is expanded once and reused, and each
+repetition counts toward the size limit. `inputType` is never longer than 5,000
+characters: a longer summary becomes `unknown` with `size limit`.
+
+Use the compact view to orient yourself: to compare similar tools, to see
+which arguments are required, or to write a call with simple arguments. Get
+the full schema when `complete` is `false` and a constraint that it leaves out
+can matter, when a call fails validation, when you need `outputSchema` or other
+definition fields, or when the exact JSON Schema matters.
+
+The compact view is informational. MCPX does not validate, authorize or change
+a call with it. `mcpx_call_tool`, approvals and read-only checks use the full
+definition, and the upstream server validates the arguments against its own
+schema. Hidden and denied tools get the same `Tool unavailable` error in both
+formats, and an unknown `format` is an invalid argument. Gateways before this
+feature reject `format` as an unrecognized argument.
 
 ## Read-only eligibility
 

@@ -5,6 +5,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import z from "zod/v4";
 import { ReadOnlyEligibility } from "../code-mode/policy.js";
+import { compactInputType } from "./compact-schema.js";
 
 const MAX_RESULTS = 20;
 const MAX_DESCRIPTION_LENGTH = 300;
@@ -31,6 +32,9 @@ const searchSchema = z
   })
   .strict();
 const nameSchema = z.object({ name: z.string().min(1).max(500) }).strict();
+const schemaLookupSchema = nameSchema
+  .extend({ format: z.enum(["full", "compact"]).default("full") })
+  .strict();
 const callSchema = nameSchema
   .extend({
     arguments: z.record(z.string(), z.unknown()).default({}),
@@ -87,10 +91,19 @@ export const LAZY_TOOLS: Tool[] = [
   {
     name: "mcpx_get_tool_schema",
     description:
-      "Get the complete definition and argument schema of one tool returned by mcpx_search_tools. Inspect it before calling the tool.",
+      'Get the complete definition and argument schema of one tool returned by mcpx_search_tools. Inspect it before calling the tool. For a shorter view of the arguments, pass format "compact".',
     inputSchema: {
       type: "object",
-      properties: { name: { type: "string", minLength: 1, maxLength: 500 } },
+      properties: {
+        name: { type: "string", minLength: 1, maxLength: 500 },
+        format: {
+          type: "string",
+          enum: ["full", "compact"],
+          default: "full",
+          description:
+            "full returns the definition unchanged. compact returns inputType, an informational TypeScript-like summary of the arguments; when complete is false, omitted lists what it leaves out, so get the full schema for exact constraints.",
+        },
+      },
       required: ["name"],
       additionalProperties: false,
     },
@@ -217,10 +230,13 @@ export async function resolveLazyToolRequest(
   }
 
   if (request.params.name === "mcpx_get_tool_schema") {
-    const parsed = nameSchema.safeParse(args);
+    const parsed = schemaLookupSchema.safeParse(args);
     if (!parsed.success) return invalidArguments(parsed.error.message);
     const tool = visibleTools.find((tool) => tool.name === parsed.data.name);
-    return tool ? jsonResult(tool) : unavailableTool();
+    if (!tool) return unavailableTool();
+    return jsonResult(
+      parsed.data.format === "compact" ? compactToolDefinition(tool) : tool,
+    );
   }
 
   if (request.params.name === "mcpx_call_tool") {
@@ -249,6 +265,29 @@ export async function resolveLazyToolRequest(
   return errorResult(
     "Use a permitted built-in management tool directly, or use mcpx_list_servers, mcpx_search_tools, mcpx_get_tool_schema, or mcpx_call_tool for upstream tools on this endpoint.",
   );
+}
+
+/*
+ * The compact schema view: the exact name, bounded text, the upstream hints
+ * and an informational input summary. It never replaces the definition that
+ * calls, approvals and read-only checks use.
+ */
+function compactToolDefinition(tool: Tool): Record<string, unknown> {
+  const annotations = projectAnnotations(tool.annotations);
+  return {
+    name: tool.name,
+    format: "compact",
+    ...(tool.title ? { title: cutText(tool.title) } : {}),
+    ...(tool.description ? { description: cutText(tool.description) } : {}),
+    ...(annotations ? { annotations } : {}),
+    ...compactInputType(tool.inputSchema),
+  };
+}
+
+function cutText(text: string): string {
+  return text.length > MAX_DESCRIPTION_LENGTH
+    ? `${text.slice(0, MAX_DESCRIPTION_LENGTH - 3)}...`
+    : text;
 }
 
 function projectAnnotations(

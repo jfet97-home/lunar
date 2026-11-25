@@ -20,6 +20,11 @@ Inside the script:
   `await mcpx.searchTools(query, { limit, offset, readOnly })` and
   `await mcpx.getToolSchema(name)` return the same data as the discovery
   tools. Discover a schema before calling an unfamiliar tool.
+- `await mcpx.getToolSchema(name, { format: "compact" })` returns the compact
+  view described in [discovery](discovery.md#compact-or-full-schema): an
+  informational `inputType` with `complete` and `omitted`. Use it to compare
+  several candidates inside the script, then fetch the full schema of the tool
+  you call when `complete` is `false` and a left-out constraint can matter.
 - `await mcpx.callTool(name, args)` returns
   `{ isError, content, structuredContent, text, data }`. `data` is the structured
   result, or the text parsed as JSON when possible.

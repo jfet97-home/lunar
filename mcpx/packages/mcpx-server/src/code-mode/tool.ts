@@ -16,7 +16,8 @@ export const CODE_MODE_RESERVED_TOOL_NAMES: ReadonlySet<string> = new Set([
 
 const SCRIPT_INTERFACE = [
   "`code` is the body of an async function: use await and return a JSON-serializable value.",
-  "Use await mcpx.listServers(), await mcpx.searchTools(query, { limit, offset, readOnly }), and await mcpx.getToolSchema(name) to discover tools.",
+  "Use await mcpx.listServers(), await mcpx.searchTools(query, { limit, offset, readOnly }), and await mcpx.getToolSchema(name, { format }) to discover tools.",
+  'With { format: "compact" }, getToolSchema returns an informational TypeScript-like inputType instead of the full schema; when its complete field is false, get the full schema for exact constraints.',
   "Search results include readOnlyEligibility. Set readOnly to true to find only tools eligible for mcpx_execute_readonly.",
   "await mcpx.callTool(name, args) returns { isError, content, structuredContent, text, data }. The data field contains structuredContent or parsed JSON text.",
   "mcpx.describe(value) returns a bounded description of its types, keys, and array lengths.",
@@ -92,6 +93,6 @@ export function buildCodeModeReadOnlyTool(limits: CodeModeLimits): Tool {
 }
 
 export const CODE_MODE_INSTRUCTIONS =
-  "Use direct tool calls for a single small lookup. For a chain of calls or a large response you can filter, use mcpx_execute. It runs JavaScript on MCPX so you can inspect full schemas and intermediate results inside the script and return just what you need. For read-only work of this kind, use mcpx_execute_readonly and find eligible tools with mcpx.searchTools(query, { readOnly: true }). MCPX checks permissions on every inner call.";
+  "Use direct tool calls for a single small lookup. For a chain of calls or a large response you can filter, use mcpx_execute. It runs JavaScript on MCPX so you can inspect full schemas and intermediate results inside the script and return just what you need. For read-only work of this kind, use mcpx_execute_readonly and find eligible tools with mcpx.searchTools(query, { readOnly: true }). MCPX checks permissions on every inner call. Use loops and if statements in Code Mode when you can decide the rules in advance. Code Mode can only call tools available through MCPX. For local work outside the gateway, such as file searches, Git, or tests, consider grouping related steps in a shell script when shell access is available.";
 
 export const CATALOG_INSTRUCTIONS = `MCPX is a gateway to multiple MCP servers; their tools are listed with server-prefixed names. ${CODE_MODE_INSTRUCTIONS}`;

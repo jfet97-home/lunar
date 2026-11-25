@@ -17,7 +17,10 @@ services whose tools are visible to this caller; it is not a complete connection
 health report. Choose a service relevant to the user's task, then:
 
 1. Call `mcpx_search_tools` with service and task keywords.
-2. Retrieve the selected target's schema with `mcpx_get_tool_schema`.
+2. Retrieve the selected target's schema with `mcpx_get_tool_schema`. When that
+   tool advertises `format`, add `"format": "compact"` for a short, informational
+   summary of the arguments; get the full schema when the summary is not
+   `complete` and a left-out constraint can matter.
 3. Call `mcpx_call_tool` using the exact returned target name and matching arguments.
 
 Read [discovery and execution](references/discovery.md) for payload examples, paging,

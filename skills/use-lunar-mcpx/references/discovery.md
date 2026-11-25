@@ -26,6 +26,34 @@ The default limit is five and the maximum is twenty. If relevant results are mis
 refine the service/task query or use `offset` with a returned `nextOffset`. Keep
 paging bounded to the user's task. Schema retrieval precedes execution.
 
+## Compact or full schema
+
+Newer gateways accept an optional `format` in `mcpx_get_tool_schema`; check its
+advertised definition. The default `"full"` returns the complete definition
+unchanged.
+
+```text
+mcpx_get_tool_schema({"name": "<exact name>", "format": "compact"})
+-> {"name":"<exact name>","format":"compact","description":"...","inputType":"{ id: string; mode?: \"raw\" | \"html\" }","complete":true}
+```
+
+`inputType` is a TypeScript-like summary of the `arguments` object: names, `?`
+for optional properties, types, nested objects, arrays and enums. `complete` is
+`true` when the renderer detects no omissions. Use the full schema for exact
+validation rules, including whether undeclared object properties are accepted.
+When `complete` is `false`, `omitted` lists differences such as `pattern`, `minimum`,
+`integer` (shown as `number`), `oneOf` when alternatives can overlap, or
+`size limit` when the summary was cut.
+
+Use the compact view to compare candidate tools, to see which arguments are
+required, or to write a call with simple arguments. Get the full schema when
+`complete` is `false` and a left-out constraint can matter, when a call fails
+validation, when you need `outputSchema`, or when the user asks for the exact
+schema. The summary is informational only: the gateway does not validate or
+approve calls with it, and the upstream tool validates against its own schema.
+Hidden tools are unavailable in both formats. Older gateways reject `format` as
+an unrecognized argument; retry without it.
+
 ## Read-only eligibility
 
 Newer gateways add `readOnlyEligibility` to each search result. It is the

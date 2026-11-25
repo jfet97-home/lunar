@@ -224,7 +224,8 @@ const PRELUDE = `
       ),
     searchTools: (query, searchOptions) =>
       request("search", { ...options(searchOptions), query }),
-    getToolSchema: (name) => request("schema", { name }),
+    getToolSchema: (name, schemaOptions) =>
+      request("schema", { ...options(schemaOptions), name }),
     listServers: () => request("servers", {}),
   });
 })();

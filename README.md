@@ -84,7 +84,7 @@ The `/mcp/lazy` endpoint advertises four discovery tools and, by default, nine b
 | --- | --- | --- |
 | 1. Learn what is connected | `mcpx_list_servers` | Visible server names and their existing descriptions, when available. |
 | 2. Find a tool for the task | `mcpx_search_tools` | A short list of matching tools, ranked by semantic and keyword search. |
-| 3. Inspect its arguments | `mcpx_get_tool_schema` | The selected tool's full schema. |
+| 3. Inspect its arguments | `mcpx_get_tool_schema` | The selected tool's full schema, or with `"format": "compact"` a short TypeScript-like summary of its arguments. |
 | 4. Use it | `mcpx_call_tool` | The upstream tool's result. |
 
 For example, a client can first learn that Honeycomb is available, search for a tracing task, inspect the matching tool, and call it. It only retrieves schemas for the tools it chooses.

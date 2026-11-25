@@ -35,7 +35,7 @@ return pages.map((result) => result.text.slice(0, 500));
 | ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
 | `mcpx.listServers()`                                   | The `mcpx_list_servers` result for the caller.                                                               |
 | `mcpx.searchTools(query, { limit, offset, readOnly })` | The `mcpx_search_tools` result: names, descriptions, annotations and read-only eligibility, without schemas. |
-| `mcpx.getToolSchema(name)`                             | One full tool definition, fetched on demand.                                                                 |
+| `mcpx.getToolSchema(name, { format })`                 | One full tool definition, fetched on demand. `{ format: "compact" }` returns a compact view instead.         |
 | `mcpx.callTool(name, args)`                            | `{ isError, content, structuredContent, text, data }`.                                                       |
 | `mcpx.describe(value)`                                 | A bounded description of the value's shape, without its values. Runs in the script.                          |
 
@@ -58,6 +58,32 @@ whose `name` is `McpxError` and whose `code` gives the reason:
 `console.log`, `info`, `warn`, `error` and `debug` output is returned with the
 result. Scripts have no filesystem, network, timers, modules, process access or
 credentials.
+
+### Compare arguments with compact schemas
+
+`mcpx.getToolSchema(name, { format: "compact" })` returns the
+[compact schema view](lazy-tools.md#compact-schema-view): an informational
+TypeScript-like `inputType` of the tool's arguments, with `complete` and
+`omitted` fields that say what it leaves out. Use it to compare candidates
+without loading their full schemas:
+
+```js
+const found = await mcpx.searchTools("jira issue", { limit: 5 });
+const views = await Promise.all(
+  found.tools.map((tool) =>
+    mcpx.getToolSchema(tool.name, { format: "compact" }),
+  ),
+);
+return views.map(({ name, inputType, complete }) => ({
+  name,
+  inputType,
+  complete,
+}));
+```
+
+Before calling a tool whose view has `complete: false`, fetch its full schema
+with `mcpx.getToolSchema(name)` when a constraint in `omitted` can matter.
+The view is never used to check or approve a call.
 
 ### Inspect a shape
 
