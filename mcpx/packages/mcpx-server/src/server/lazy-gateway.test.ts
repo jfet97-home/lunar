@@ -1489,6 +1489,13 @@ describe("Code Mode on the gateway endpoints", () => {
         expect(instructions).toContain(
           "mcpx.searchTools(query, { readOnly: true })",
         );
+        expect(instructions).toContain("Use loops and if statements");
+        expect(instructions).toContain(
+          "only call tools available through MCPX",
+        );
+        expect(instructions).toContain(
+          "consider grouping related steps in a shell script",
+        );
         const readOnlyTool = (await client.listTools()).tools.find(
           (tool) => tool.name === "mcpx_execute_readonly",
         );
