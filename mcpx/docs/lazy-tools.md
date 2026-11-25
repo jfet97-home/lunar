@@ -19,7 +19,8 @@ reads. See the [Code Mode guide](code-mode.md).
    existing descriptions when available. Startup instructions recommend making
    this call immediately after connecting.
 2. Call `mcpx_search_tools` with service/task keywords. It returns five matches by
-   default, including names, short descriptions, and tool annotations.
+   default, including names, short descriptions, tool annotations, and
+   [read-only eligibility](#read-only-eligibility).
 3. Call `mcpx_get_tool_schema` with one returned name to obtain its full definition.
 4. Call `mcpx_call_tool` with that name and an `arguments` object matching its
    schema. Permitted built-in management tools are advertised directly under
@@ -45,6 +46,44 @@ Search results omit argument and output schemas. `limit` is capped at 20;
 `offset` and `nextOffset` allow bounded browsing. An exact tool name selects that
 tool directly. Tool names returned by discovery are the same qualified names
 advertised by the full endpoint.
+
+## Read-only eligibility
+
+Each search result carries `readOnlyEligibility`: the gateway's own decision
+whether [`mcpx_execute_readonly`](code-mode.md#read-only-scripts) would run that
+tool now for this caller. It applies the same rules as the read-only tool: the
+operator's exact trust entries, the built-in read-only tools, the refusal of
+declared writes and of gateway wrapper names. `annotations` remain the upstream
+server's own hints, passed through unchanged; a `readOnlyHint` alone does not make
+a tool eligible. An ineligible result gives a `reason`:
+
+| Reason           | Meaning                                                                                                                                              |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `declares_write` | The definition sets `readOnlyHint: false` or `destructiveHint: true`. A trust entry does not override it.                                            |
+| `not_trusted`    | The operator lists neither the exact tool nor, for a tool marked `readOnlyHint: true`, its exact server. Patterns with `*` do not count.             |
+| `reserved`       | The name is a gateway wrapper such as `mcpx_call_tool`.                                                                                              |
+| `unavailable`    | This gateway does not offer `mcpx_execute_readonly`, because Code Mode is disabled or its runner is missing. `readOnly: true` then returns an error. |
+
+Pass `readOnly: true` to return only eligible tools:
+
+```text
+mcpx_search_tools({"query": "jira issue", "readOnly": true})
+→ {"tools":[{"name":"jira__get_issue","description":"Get an issue","annotations":{"readOnlyHint":true},"readOnlyEligibility":{"eligible":true}}],"totalMatches":1}
+```
+
+The filter keeps the ordinary ranking and skips ineligible tools; `totalMatches`
+and `nextOffset` count only eligible tools. Search without it to see why a tool
+was left out. Omitting `readOnly`, or passing `false`, returns the same results
+as before, with the added field. Scripts use the same option:
+`mcpx.searchTools(query, { readOnly: true })`.
+
+Eligibility describes only tools visible to the caller and grants nothing.
+`mcpx_execute_readonly` checks every call again when it runs, so a change to a
+definition, trust list or permission in between applies at that point.
+Gateways before this feature return no `readOnlyEligibility` and reject
+`readOnly` as an unrecognized argument (`invalid_request` inside a script), so
+they never return unfiltered results for a filtered search. Treat a result
+without the field as unknown, not eligible.
 
 Search, schema lookup, and execution check the caller's current permitted tool
 set. Cached embeddings do not grant access. Direct management calls and wrapped

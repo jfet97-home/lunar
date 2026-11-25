@@ -102,7 +102,9 @@ model. The client controls approval of `mcpx_execute`. Each inner call keeps
 the caller's gateway permissions and audit, and the result reports the bytes
 that each call returned. `mcpx_execute_readonly` runs the same kind of script
 but refuses every inner call that the gateway does not trust as a read, so a
-client can approve it separately.
+client can approve it separately. Tool search reports whether each result is
+eligible for it, and `readOnly: true` returns only eligible tools; each call is
+still checked when it runs.
 See the [Code Mode guide](mcpx/docs/code-mode.md) for the script interface,
 approval and read-only policy, isolation, and limits.
 

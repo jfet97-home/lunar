@@ -124,6 +124,15 @@ async function startFakeUpstream(name: string): Promise<FakeUpstream> {
         return { content: [{ type: "text", text: JSON.stringify({ title }) }] };
       },
     );
+    mcp.registerTool(
+      "archive_note",
+      { inputSchema: {}, annotations: { destructiveHint: true } },
+      async () => {
+        record("archive_note", {});
+        writes.push("archived");
+        return { content: [{ type: "text", text: "archived" }] };
+      },
+    );
     mcp.registerTool("secret_note", { inputSchema: {} }, async () => {
       record("secret_note", {});
       return { content: [{ type: "text", text: "secret" }] };
@@ -262,9 +271,11 @@ describe("Code Mode through the full gateway", () => {
             "notes__get_note",
             "notes__whoami",
             "notes__slow",
+            // listed, but its definition declares a write
+            "notes__archive_note",
             "later__*",
           ],
-          trustedAnnotationServers: [],
+          trustedAnnotationServers: ["later"],
         },
       },
     });
@@ -523,6 +534,108 @@ describe("Code Mode through the full gateway", () => {
     });
     expect(forGuests.found).not.toContain("notes__get_note");
     expect(notes.calls.map((call) => call.tool)).not.toContain("secret_note");
+  });
+
+  it("reports in direct and script search the read-only decision that mcpx_execute_readonly enforces", async () => {
+    const agents = await connect("/mcp/lazy");
+    const guests = await connect("/mcp/lazy", { consumer: "guests" });
+    await harness.services.upstreamHandler.addClient(target(later));
+    const search = async (
+      client: Client,
+      args: Record<string, unknown>,
+    ): Promise<{
+      tools: { name: string; readOnlyEligibility: unknown }[];
+      totalMatches: number;
+    }> => {
+      const result = await client.callTool({
+        name: "mcpx_search_tools",
+        arguments: args,
+      });
+      const block = (result.content as { type: string; text: string }[])[0];
+      return JSON.parse(block?.text ?? "{}");
+    };
+    const expected = {
+      // exact entries, with or without a readOnlyHint
+      notes__list_notes: { eligible: true },
+      notes__whoami: { eligible: true },
+      // readOnlyHint on a server whose hints the operator does not trust
+      notes__peek: { eligible: false, reason: "not_trusted" },
+      notes__create_note: { eligible: false, reason: "not_trusted" },
+      notes__archive_note: { eligible: false, reason: "declares_write" },
+      // readOnlyHint on a trusted server
+      later__peek: { eligible: true },
+      // only the later__* pattern lists it
+      later__create_note: { eligible: false, reason: "not_trusted" },
+    };
+    const names = Object.keys(expected);
+    try {
+      const direct: Record<string, unknown> = {};
+      for (const name of names) {
+        const found = await search(agents, { query: name });
+        expect(found.tools.map((tool) => tool.name)).toEqual([name]);
+        direct[name] = found.tools[0]?.readOnlyEligibility;
+        expect(
+          (await search(agents, { query: name, readOnly: true })).totalMatches,
+        ).toBe(expected[name as keyof typeof expected].eligible ? 1 : 0);
+      }
+      expect(direct).toEqual(expected);
+      // trust does not reveal a tool hidden from this caller
+      const shown = async (
+        client: Client,
+        query: string,
+        readOnly: boolean,
+      ): Promise<string[]> =>
+        (await search(client, { query, limit: 20, readOnly })).tools.map(
+          (tool) => tool.name,
+        );
+      for (const readOnly of [false, true]) {
+        expect(
+          await shown(agents, "notes__secret_note", readOnly),
+        ).not.toContain("notes__secret_note");
+        expect(await shown(guests, "notes__get_note", readOnly)).not.toContain(
+          "notes__get_note",
+        );
+      }
+
+      const result = await agents.callTool({
+        name: "mcpx_execute_readonly",
+        arguments: {
+          code: `
+            const report = {};
+            for (const name of ${JSON.stringify(names)}) {
+              const found = await mcpx.searchTools(name, { readOnly: true });
+              let ran = true;
+              try { await mcpx.callTool(name, name.endsWith("create_note") ? { title: "never" } : {}); }
+              catch (error) { if (error.code !== "read_only_blocked") throw error; ran = false; }
+              report[name] = { listed: found.tools.length === 1, ran };
+            }
+            const broad = await mcpx.searchTools("note", { limit: 20, readOnly: true });
+            return {
+              report,
+              broad: broad.tools.every((tool) => tool.readOnlyEligibility.eligible),
+              counted: broad.totalMatches === broad.tools.length,
+            };
+          `,
+        },
+      });
+      const block = (result.content as { type: string; text: string }[])[0];
+      const output = JSON.parse(block?.text ?? "{}") as Output;
+      expect(output.ok).toBe(true);
+      expect(output.result).toEqual({
+        report: Object.fromEntries(
+          Object.entries(expected).map(([name, { eligible }]) => [
+            name,
+            { listed: eligible, ran: eligible },
+          ]),
+        ),
+        broad: true,
+        counted: true,
+      });
+      expect(notes.writes).toEqual([]);
+      expect(later.writes).toEqual([]);
+    } finally {
+      await harness.services.upstreamHandler.removeClient("later");
+    }
   });
 
   it("reaches a server registered after the session started", async () => {

@@ -1,4 +1,5 @@
 import { CallToolRequest, Tool } from "@modelcontextprotocol/sdk/types.js";
+import { ReadOnlyEligibility } from "../code-mode/policy.js";
 import {
   isLazyManagementCapability,
   LAZY_TOOLS,
@@ -175,6 +176,117 @@ describe("lazy tool discovery", () => {
     expect(schema).toMatchObject({
       kind: "result",
       result: { content: [{ text: JSON.stringify(catalog[200]) }] },
+    });
+  });
+
+  it("filters read-only eligibility over the unfiltered ranking with accurate paging", async () => {
+    const catalog = ["svc__write", "svc__read", "svc__drop", "svc__list"].map(
+      (name) => tool(name),
+    );
+    const write = catalog[0];
+    if (!write) throw new Error("expected a tool in the catalog");
+    write.annotations = { readOnlyHint: true, destructiveHint: true };
+    const decisions: Record<string, ReadOnlyEligibility> = {
+      svc__write: { eligible: false, reason: "declares_write" },
+      svc__read: { eligible: true },
+      svc__drop: { eligible: false, reason: "not_trusted" },
+      svc__list: { eligible: true },
+    };
+    // a fixed ranking in which an ineligible tool comes first
+    const search = jest.fn(async (tools: Tool[]) => tools);
+    const page = async (args: Record<string, unknown>) => {
+      const result = await resolveLazyToolRequest(
+        request("mcpx_search_tools", { query: "svc", ...args }),
+        catalog,
+        search,
+        undefined,
+        undefined,
+        (candidate) => decisions[candidate.name] ?? { eligible: true },
+      );
+      if (result.kind !== "result") throw new Error("unexpected execution");
+      const text = result.result.content[0];
+      if (text?.type !== "text") throw new Error("expected discovery text");
+      return JSON.parse(text.text);
+    };
+
+    const unfiltered = await page({ limit: 20 });
+    expect(unfiltered).toEqual({
+      tools: catalog.map((entry) => ({
+        name: entry.name,
+        description: entry.description,
+        ...(entry.annotations ? { annotations: entry.annotations } : {}),
+        readOnlyEligibility: decisions[entry.name],
+      })),
+      totalMatches: 4,
+    });
+    // upstream hints stay as they are, beside the gateway's own decision
+    expect(unfiltered.tools[0]).toMatchObject({
+      annotations: { readOnlyHint: true, destructiveHint: true },
+      readOnlyEligibility: { eligible: false, reason: "declares_write" },
+    });
+    expect(await page({ limit: 20, readOnly: false })).toEqual(unfiltered);
+
+    expect(await page({ limit: 1, readOnly: true })).toEqual({
+      tools: [expect.objectContaining({ name: "svc__read" })],
+      totalMatches: 2,
+      nextOffset: 1,
+    });
+    expect(await page({ limit: 1, offset: 1, readOnly: true })).toEqual({
+      tools: [
+        expect.objectContaining({
+          name: "svc__list",
+          readOnlyEligibility: { eligible: true },
+        }),
+      ],
+      totalMatches: 2,
+    });
+    // the same query reaches the same index whatever the filter
+    expect(search.mock.calls.every(([tools]) => tools === catalog)).toBe(true);
+
+    const invalid = await resolveLazyToolRequest(
+      request("mcpx_search_tools", { query: "svc", readOnly: "yes" }),
+      catalog,
+    );
+    expect(invalid).toMatchObject({
+      kind: "result",
+      result: { isError: true },
+    });
+  });
+
+  it("reports read-only execution as unavailable when the gateway cannot run it", async () => {
+    const catalog = [tool("svc__read")];
+    const unfiltered = await resolveLazyToolRequest(
+      request("mcpx_search_tools", { query: "svc__read" }),
+      catalog,
+    );
+    expect(unfiltered).toMatchObject({
+      kind: "result",
+      result: {
+        content: [
+          {
+            text: expect.stringContaining(
+              '"readOnlyEligibility":{"eligible":false,"reason":"unavailable"}',
+            ),
+          },
+        ],
+      },
+    });
+    const filtered = await resolveLazyToolRequest(
+      request("mcpx_search_tools", { query: "svc__read", readOnly: true }),
+      catalog,
+    );
+    expect(filtered).toMatchObject({
+      kind: "result",
+      result: {
+        isError: true,
+        content: [
+          {
+            text: expect.stringContaining(
+              "mcpx_execute_readonly is not available",
+            ),
+          },
+        ],
+      },
     });
   });
 

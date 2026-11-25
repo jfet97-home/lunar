@@ -1,5 +1,5 @@
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
-import { CodeModeLimits } from "./policy.js";
+import type { CodeModeLimits } from "./policy.js";
 
 export const CODE_MODE_TOOL_NAME = "mcpx_execute";
 export const CODE_MODE_READONLY_TOOL_NAME = "mcpx_execute_readonly";
@@ -16,7 +16,10 @@ export const CODE_MODE_RESERVED_TOOL_NAMES: ReadonlySet<string> = new Set([
 
 const SCRIPT_INTERFACE = [
   "`code` is the body of an async function: use await and return a JSON-serializable value.",
-  "Inside it: await mcpx.listServers(); await mcpx.searchTools(query, { limit, offset }); await mcpx.getToolSchema(name); await mcpx.callTool(name, args) returns { isError, content, structuredContent, text, data }, where data is structuredContent or parsed JSON text; mcpx.describe(value) returns a bounded description of a value's shape (types, keys, array lengths) without its values.",
+  "Use await mcpx.listServers(), await mcpx.searchTools(query, { limit, offset, readOnly }), and await mcpx.getToolSchema(name) to discover tools.",
+  "Search results include readOnlyEligibility. Set readOnly to true to find only tools eligible for mcpx_execute_readonly.",
+  "await mcpx.callTool(name, args) returns { isError, content, structuredContent, text, data }. The data field contains structuredContent or parsed JSON text.",
+  "mcpx.describe(value) returns a bounded description of its types, keys, and array lengths.",
   "console.log output is returned. There is no filesystem, network, timer or module access.",
   "Every inner call uses your normal MCPX permissions and audit.",
 ];
@@ -72,7 +75,7 @@ export function buildCodeModeReadOnlyTool(limits: CodeModeLimits): Tool {
       "Run JavaScript in the same isolated MCPX sandbox as mcpx_execute, limited to reads the gateway trusts.",
       "Inner calls run only for built-in read-only MCPX tools and for tools the gateway operator trusts as reads.",
       "Every other call, including tools with unknown side effects or a write annotation, is refused before it runs with code read_only_blocked; an upstream readOnlyHint alone does not make a tool trusted.",
-      "Discovery works as usual. The gateway asks for no approval inside this tool.",
+      "The gateway checks eligibility again on each call. The gateway asks for no approval inside this tool.",
       ...SCRIPT_INTERFACE,
       "A gateway failure (not visible, denied, read_only_blocked) rejects with an Error whose code says why.",
       scriptLimits(limits),
@@ -89,6 +92,6 @@ export function buildCodeModeReadOnlyTool(limits: CodeModeLimits): Tool {
 }
 
 export const CODE_MODE_INSTRUCTIONS =
-  "For multi-step work, mcpx_execute runs JavaScript server-side that discovers, chains and filters MCPX tool calls and returns only the final value; prefer it over many separate calls when intermediate results are large. Inner calls keep your permissions and are subject to the gateway's tool approval policy. mcpx_execute_readonly runs the same kind of script but refuses every inner call that the gateway does not trust as a read.";
+  "Use direct tool calls for a single small lookup. For a chain of calls or a large response you can filter, use mcpx_execute. It runs JavaScript on MCPX so you can inspect full schemas and intermediate results inside the script and return just what you need. For read-only work of this kind, use mcpx_execute_readonly and find eligible tools with mcpx.searchTools(query, { readOnly: true }). MCPX checks permissions on every inner call.";
 
 export const CATALOG_INSTRUCTIONS = `MCPX is a gateway to multiple MCP servers; their tools are listed with server-prefixed names. ${CODE_MODE_INSTRUCTIONS}`;

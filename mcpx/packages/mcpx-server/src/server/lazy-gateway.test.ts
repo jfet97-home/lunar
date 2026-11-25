@@ -27,10 +27,15 @@ let buildDownstreamTransportsRouter: (typeof import("./downstream-transports.js"
 
 jest.mock("../services/local-tool-search.js", () => ({
   LocalToolSearch: class {
+    // an exact name, else every description containing the query, in catalog order
     async search(tools: Tool[], query: string): Promise<Tool[]> {
-      return tools.filter(
-        (tool) => tool.name.toLowerCase() === query.toLowerCase(),
-      );
+      const lower = query.toLowerCase();
+      const exact = tools.filter((tool) => tool.name.toLowerCase() === lower);
+      return exact.length > 0
+        ? exact
+        : tools.filter((tool) =>
+            (tool.description ?? "").toLowerCase().includes(lower),
+          );
     }
   },
 }));
@@ -505,7 +510,9 @@ describe("lazy Streamable HTTP gateway", () => {
           expect(lazyTools.map((tool) => tool.name)).toContain(
             "mcpx_call_tool",
           );
-          expect(client.getInstructions()).toContain("without searching first");
+          expect(client.getInstructions()).toContain(
+            "management tools directly by their mcpx__management_* names",
+          );
           const servers = JSON.parse(
             resultText(
               await client.callTool({
@@ -983,6 +990,36 @@ describe("lazy Streamable HTTP gateway", () => {
     }
   });
 
+  it("reports read-only eligibility as unavailable when Code Mode is not available", async () => {
+    const harness = await makeHarness();
+    try {
+      const { client } = await harness.connectClient("/mcp/lazy");
+      const search = (readOnly?: boolean) =>
+        client.callTool({
+          name: "mcpx_search_tools",
+          arguments: {
+            query: ALLOWED_NAME,
+            ...(readOnly === undefined ? {} : { readOnly }),
+          },
+        });
+      const unfiltered = await search();
+      expect(JSON.parse(resultText(unfiltered)).tools).toEqual([
+        expect.objectContaining({
+          name: ALLOWED_NAME,
+          readOnlyEligibility: { eligible: false, reason: "unavailable" },
+        }),
+      ]);
+      expect(resultText(await search(false))).toBe(resultText(unfiltered));
+      const filtered = await search(true);
+      expect(filtered.isError).toBe(true);
+      expect(resultText(filtered)).toMatch(
+        /mcpx_execute_readonly is not available/,
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("deduplicates concurrent calls and rechecks permissions before a cached replay", async () => {
     let releaseCall: ((value: unknown) => void) | undefined;
     let callStarted: (() => void) | undefined;
@@ -1343,8 +1380,17 @@ describe("Code Mode on the gateway endpoints", () => {
       ]);
       expect(catalogNames).toContain("mcpx_execute_readonly");
       for (const { client } of [catalog, lazy]) {
-        expect(client.getInstructions()).toContain("mcpx_execute");
-        expect(client.getInstructions()).toContain("mcpx_execute_readonly");
+        const instructions = client.getInstructions();
+        expect(instructions).toContain(
+          "direct tool calls for a single small lookup",
+        );
+        expect(instructions).toContain(
+          "a chain of calls or a large response you can filter, use mcpx_execute",
+        );
+        expect(instructions).toContain("use mcpx_execute_readonly");
+        expect(instructions).toContain(
+          "mcpx.searchTools(query, { readOnly: true })",
+        );
         const readOnlyTool = (await client.listTools()).tools.find(
           (tool) => tool.name === "mcpx_execute_readonly",
         );
@@ -1909,6 +1955,208 @@ describe("Code Mode on the gateway endpoints", () => {
         "identity_changed",
       ]);
       expect(harness.upstreamCallTool).toHaveBeenCalledTimes(2);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("reports in direct and script search the read-only decision that execution enforces", async () => {
+    const notes = (
+      serverName: string,
+      capabilityName: string,
+      annotations?: Tool["annotations"],
+      origin: ToolEntry["origin"] = "upstream",
+    ): ToolEntry => {
+      const name = `${serverName}__${capabilityName}`;
+      const definition = makeTool(name, `Notes tool ${name}`);
+      return {
+        serverName,
+        capabilityName,
+        origin,
+        definition: annotations ? { ...definition, annotations } : definition,
+      };
+    };
+    const harness = await makeHarness({
+      // catalog order is the search ranking; an ineligible tool ranks first
+      entries: [
+        notes("tracker", "create_issue"),
+        notes("docs", "get_page"),
+        notes("docs", "delete_page", { destructiveHint: true }),
+        notes("docs", "purge"),
+        notes("kb", "read", { readOnlyHint: true }),
+        notes("kb", "write", { readOnlyHint: false }),
+        notes("wiki", "read", { readOnlyHint: true }),
+        notes(
+          "mcpx",
+          "management_list_servers",
+          { readOnlyHint: true },
+          "internal",
+        ),
+        notes("secrets", "read"),
+        notes("legacy", "fetch"),
+        notes("oauth", "grant", undefined, "internal"),
+      ],
+      codeMode: new CodeModeService(
+        {
+          enabled: true,
+          requireToolApproval: false,
+          runnerPath,
+          limits: { ...DEFAULT_CODE_MODE_LIMITS, wallMs: 15_000 },
+          trust: {
+            trustedReadTools: [
+              ALLOWED_NAME,
+              "docs__delete_page",
+              "docs__*",
+              // trust never makes denied, inactive or hidden tools visible
+              DENIED_NAME,
+              INACTIVE_NAME,
+              HIDDEN_NAME,
+            ],
+            trustedAnnotationServers: ["kb"],
+          },
+        },
+        noOpLogger,
+      ),
+    });
+    const eligibility = {
+      tracker__create_issue: { eligible: false, reason: "not_trusted" },
+      // an exact entry trusts a tool without annotations
+      [ALLOWED_NAME]: { eligible: true },
+      docs__delete_page: { eligible: false, reason: "declares_write" },
+      // a pattern is not enough
+      docs__purge: { eligible: false, reason: "not_trusted" },
+      kb__read: { eligible: true },
+      kb__write: { eligible: false, reason: "declares_write" },
+      wiki__read: { eligible: false, reason: "not_trusted" },
+      mcpx__management_list_servers: { eligible: true },
+    };
+    const eligibleNames = [
+      ALLOWED_NAME,
+      "kb__read",
+      "mcpx__management_list_servers",
+    ];
+    const search = async (client: Client, args: Record<string, unknown>) =>
+      JSON.parse(
+        resultText(
+          await client.callTool({ name: "mcpx_search_tools", arguments: args }),
+        ),
+      ) as {
+        tools: { name: string; readOnlyEligibility: unknown }[];
+        totalMatches: number;
+        nextOffset?: number;
+      };
+    const SCRIPT_SEARCH = `
+      const unfiltered = await mcpx.searchTools("notes", { limit: 20 });
+      const eligible = [];
+      let offset = 0;
+      do {
+        const page = await mcpx.searchTools("notes", { limit: 2, offset, readOnly: true });
+        eligible.push(...page.tools.map((tool) => tool.name));
+        offset = page.nextOffset;
+      } while (offset !== undefined);
+    `;
+    try {
+      const { client } = await harness.connectClient("/mcp/lazy");
+      const unfiltered = await search(client, { query: "notes", limit: 20 });
+      expect(
+        Object.fromEntries(
+          unfiltered.tools.map((tool) => [tool.name, tool.readOnlyEligibility]),
+        ),
+      ).toEqual(eligibility);
+      expect(unfiltered.tools.map((tool) => tool.name)).toEqual(
+        Object.keys(eligibility),
+      );
+      expect(unfiltered.totalMatches).toBe(8);
+      // upstream hints are passed through beside the gateway's decision
+      expect(unfiltered.tools[5]).toMatchObject({
+        name: "kb__write",
+        annotations: { readOnlyHint: false },
+      });
+      for (const name of [DENIED_NAME, INACTIVE_NAME, HIDDEN_NAME]) {
+        expect(JSON.stringify(unfiltered)).not.toContain(name);
+      }
+      expect(
+        await search(client, { query: "notes", limit: 20, readOnly: false }),
+      ).toEqual(unfiltered);
+
+      expect(
+        await search(client, { query: "notes", limit: 2, readOnly: true }),
+      ).toEqual({
+        tools: [
+          expect.objectContaining({
+            name: ALLOWED_NAME,
+            readOnlyEligibility: { eligible: true },
+          }),
+          expect.objectContaining({ name: "kb__read" }),
+        ],
+        totalMatches: 3,
+        nextOffset: 2,
+      });
+      expect(
+        await search(client, {
+          query: "notes",
+          limit: 2,
+          offset: 2,
+          readOnly: true,
+        }),
+      ).toEqual({
+        tools: [
+          expect.objectContaining({ name: "mcpx__management_list_servers" }),
+        ],
+        totalMatches: 3,
+      });
+      for (const query of ["mcpx_execute_readonly", "mcpx_search_tools"]) {
+        for (const readOnly of [false, true]) {
+          expect(await search(client, { query, readOnly })).toEqual({
+            tools: [],
+            totalMatches: 0,
+          });
+        }
+      }
+
+      // scripts see the same decisions, and the read-only tool runs exactly them
+      const ordinary = await execute(
+        client,
+        `${SCRIPT_SEARCH} return { unfiltered, eligible };`,
+      );
+      expect(ordinary.result).toEqual({
+        unfiltered,
+        eligible: eligibleNames,
+      });
+      for (const endpoint of ["/mcp", "/mcp/lazy"] as const) {
+        const { client: scripted } = await harness.connectClient(endpoint);
+        const { output } = await executeReadOnly(
+          scripted,
+          `
+            ${SCRIPT_SEARCH}
+            const ran = [];
+            for (const tool of unfiltered.tools) {
+              try { await mcpx.callTool(tool.name, { id: "1" }); ran.push(tool.name); }
+              catch (error) { if (error.code !== "read_only_blocked") throw error; }
+            }
+            return { eligible, ran };
+          `,
+        );
+        expect(output.result).toEqual({
+          eligible: eligibleNames,
+          ran: eligibleNames,
+        });
+      }
+
+      // decisions follow the live definition
+      const kbRead = harness.entries.find(
+        (entry) => entry.definition.name === "kb__read",
+      );
+      if (!kbRead) throw new Error("expected kb__read");
+      kbRead.definition = {
+        ...kbRead.definition,
+        annotations: { readOnlyHint: true, destructiveHint: true },
+      };
+      expect((await search(client, { query: "kb__read" })).tools).toEqual([
+        expect.objectContaining({
+          readOnlyEligibility: { eligible: false, reason: "declares_write" },
+        }),
+      ]);
     } finally {
       await harness.close();
     }

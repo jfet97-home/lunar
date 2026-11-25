@@ -16,8 +16,9 @@ mcpx_execute({"code": "const hits = (await mcpx.callTool(\"<server>__search\", {
 
 Inside the script:
 
-- `await mcpx.listServers()`, `await mcpx.searchTools(query, { limit, offset })`
-  and `await mcpx.getToolSchema(name)` return the same data as the discovery
+- `await mcpx.listServers()`,
+  `await mcpx.searchTools(query, { limit, offset, readOnly })` and
+  `await mcpx.getToolSchema(name)` return the same data as the discovery
   tools. Discover a schema before calling an unfamiliar tool.
 - `await mcpx.callTool(name, args)` returns
   `{ isError, content, structuredContent, text, data }`. `data` is the structured
@@ -49,6 +50,21 @@ upstream `readOnlyHint` alone is not enough. Nothing asks for approval inside
 this tool. Use it for lookups, searches and reports; use `mcpx_execute` or a
 direct call when the task needs a write or a blocked tool. A block is not an
 upstream failure: report it and choose another route instead of retrying.
+
+Find the tools it accepts before writing the script. Each search result's
+`readOnlyEligibility` gives the gateway's decision, and `readOnly: true` keeps
+only eligible tools:
+
+```text
+mcpx_search_tools({"query": "jira issue", "readOnly": true})
+```
+
+Inside a script, use `mcpx.searchTools("jira issue", { readOnly: true })`. To
+learn why a tool is missing, search without `readOnly` and read its `reason`
+(see [discovery](discovery.md#read-only-eligibility)). The read-only tool still
+checks each call when it runs, so handle `read_only_blocked` anyway. On an
+older gateway the option is rejected as an unrecognized argument; fall back to
+the call report.
 
 ## Approvals
 

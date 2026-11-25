@@ -61,6 +61,10 @@ import {
   ResolvedCall,
 } from "../code-mode/execute.js";
 import {
+  ReadOnlyEligibility,
+  readOnlyEligibility,
+} from "../code-mode/policy.js";
+import {
   CATALOG_INSTRUCTIONS,
   CODE_MODE_INSTRUCTIONS,
   CODE_MODE_READONLY_TOOL_NAME,
@@ -351,6 +355,7 @@ export async function getServer(
           discovery.search,
           discovery.listServers,
           discovery.directManagementToolNames,
+          discovery.readOnlyEligibilityOf,
         );
         if (resolved.kind === "result") return resolved.result;
         request = resolved.request;
@@ -447,8 +452,10 @@ function lazyDiscoveryContext(props: {
   search: (tools: Tool[], query: string) => Promise<Tool[]>;
   listServers: () => LazyServer[];
   directManagementToolNames: Set<string>;
+  readOnlyEligibilityOf: ((tool: Tool) => ReadOnlyEligibility) | undefined;
 } {
   const { services, sessionId, logger } = props;
+  const { codeMode } = services;
   const consumer = services.sessions.getConsumerContext(sessionId);
   const permittedTools =
     services.capabilityResolver.getPermittedTools(consumer);
@@ -462,6 +469,9 @@ function lazyDiscoveryContext(props: {
     listLazyManagementTools(permittedTools, consumer, services).map(
       (tool) => tool.name,
     ),
+  );
+  const permittedByName = new Map(
+    permittedTools.map((cap) => [cap.definition.name, cap]),
   );
   const existingSearch = toolSearches.get(services);
   const search = existingSearch ?? new LocalToolSearch(logger);
@@ -481,6 +491,21 @@ function lazyDiscoveryContext(props: {
       return listVisibleLazyServers(services, serverNames);
     },
     directManagementToolNames,
+    readOnlyEligibilityOf: codeMode.available
+      ? (tool): ReadOnlyEligibility => {
+          const permitted = permittedByName.get(tool.name);
+          // the visible definition is the one mcpx_execute_readonly classifies
+          return permitted
+            ? readOnlyEligibility({
+                name: tool.name,
+                serverName: permitted.serverName,
+                origin: permitted.origin,
+                definition: tool,
+                trust: codeMode.config.trust,
+              })
+            : { eligible: false, reason: "unavailable" };
+        }
+      : undefined,
   };
 }
 
@@ -601,6 +626,8 @@ function buildCodeModeGateway(props: {
         discovery.visibleTools,
         discovery.search,
         discovery.listServers,
+        discovery.directManagementToolNames,
+        discovery.readOnlyEligibilityOf,
       );
       return resolved.kind === "result"
         ? resolved.result
