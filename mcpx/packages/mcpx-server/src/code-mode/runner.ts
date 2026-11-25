@@ -381,7 +381,10 @@ async function run(start: StartMessage): Promise<void> {
       send({
         type: "log",
         level,
-        text: Buffer.from(text).subarray(0, Math.max(remaining, 0)).toString(),
+        text: new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+          Buffer.from(text).subarray(0, Math.max(remaining, 0)),
+          { stream: true },
+        ),
         truncated: true,
       });
       logBytes = limits.maxLogBytes;

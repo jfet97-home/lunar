@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   buildRunnerExecArgv,
+  formatSandboxLog,
   runSandbox,
   SandboxLimits,
   SandboxLog,
@@ -187,6 +188,24 @@ describe("Code Mode sandbox runner", () => {
     );
     expect(total).toBeLessThanOrEqual(LIMITS.maxLogBytes);
   });
+
+  it.each([
+    ["log", 4],
+    ["warn", 11],
+  ])(
+    "truncates console.%s output at a complete UTF-8 character",
+    async (level, maxLogBytes) => {
+      const { outcome, logs } = await run(
+        `console.${level}("aé🙂"); return 1;`,
+        { limits: { maxLogBytes } },
+      );
+      expect(outcome.status).toBe("completed");
+      expect(logs).toEqual([{ level, text: "aé" }]);
+      expect(
+        Buffer.byteLength(logs.map(formatSandboxLog).join("")),
+      ).toBeLessThanOrEqual(maxLogBytes);
+    },
+  );
 
   it("does not send empty console messages through the broker", async () => {
     const { outcome, logs } = await run(`
@@ -574,14 +593,15 @@ describe("mcpx.describe", () => {
 });
 
 describe("Code Mode runner process permissions", () => {
-  // the permission model compares real paths, and macOS links /var to /private/var
-  const probeDirectory = realpathSync(
-    mkdtempSync(path.join(tmpdir(), "mcpx-code-mode-")),
-  );
-  const probePath = path.join(probeDirectory, "probe.mjs");
-  const secretPath = path.join(probeDirectory, "..", "mcpx-code-mode-secret");
+  let probeDirectory: string | undefined;
+  let probePath: string;
 
   beforeAll(() => {
+    // the permission model compares real paths, and macOS links /var to /private/var
+    probeDirectory = mkdtempSync(path.join(tmpdir(), "mcpx-code-mode-"));
+    probeDirectory = realpathSync(probeDirectory);
+    probePath = path.join(probeDirectory, "probe.mjs");
+    const secretPath = path.join(probeDirectory, "forbidden-write");
     writeFileSync(
       probePath,
       `
@@ -606,7 +626,9 @@ process.send({
   });
 
   afterAll(() => {
-    rmSync(probeDirectory, { recursive: true, force: true });
+    if (probeDirectory) {
+      rmSync(probeDirectory, { recursive: true, force: true });
+    }
   });
 
   it("launches with the permission model, no writes and an empty environment", () => {

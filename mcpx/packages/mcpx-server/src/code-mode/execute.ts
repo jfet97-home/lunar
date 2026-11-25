@@ -10,6 +10,7 @@ import {
   CodeModeTrustPolicy,
 } from "./policy.js";
 import {
+  formatSandboxLog,
   runSandbox,
   SandboxLog,
   SandboxOutcome,
@@ -411,9 +412,7 @@ export async function executeCode(
   // nothing is sent to the runner after it stopped
   const finalCalls = calls.map(finalizeReport);
   const ok = outcome.status === "completed";
-  const logLines = logs.map(({ level, text }) =>
-    level === "log" ? text : `[${level}] ${text}`,
-  );
+  const logLines = logs.map(formatSandboxLog);
   const bytes = {
     toolResults: { ...toolBytes },
     discovery: { ...discoveryBytes },

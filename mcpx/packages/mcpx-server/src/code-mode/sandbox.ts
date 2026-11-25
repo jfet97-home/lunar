@@ -34,6 +34,10 @@ export interface SandboxLog {
   text: string;
 }
 
+export function formatSandboxLog({ level, text }: SandboxLog): string {
+  return level === "log" ? text : `[${level}] ${text}`;
+}
+
 export interface SandboxError {
   name: string;
   message: string;
@@ -242,10 +246,20 @@ export function runSandbox(props: RunSandboxProps): Promise<SandboxOutcome> {
           });
           return;
         case "log": {
-          const remaining = limits.maxLogBytes - logBytes;
+          const prefixBytes = Buffer.byteLength(
+            formatSandboxLog({ level: message.level, text: "" }),
+          );
+          const remaining = limits.maxLogBytes - logBytes - prefixBytes;
           if (remaining <= 0 || message.text.length === 0) return;
-          const text = message.text.slice(0, remaining);
-          logBytes += Buffer.byteLength(text);
+          const text =
+            Buffer.byteLength(message.text) <= remaining
+              ? message.text
+              : new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+                  Buffer.from(message.text).subarray(0, remaining),
+                  { stream: true },
+                );
+          if (text.length === 0) return;
+          logBytes += prefixBytes + Buffer.byteLength(text);
           onLog({ level: message.level, text });
           return;
         }
