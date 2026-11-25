@@ -60,6 +60,29 @@ async function run(
 describe("Code Mode sandbox runner", () => {
   jest.setTimeout(30_000);
 
+  it("keeps the default schema request and forwards lookup options under the given name", async () => {
+    const { outcome } = await run(`
+      return [
+        await mcpx.getToolSchema("docs__get_page"),
+        await mcpx.getToolSchema("docs__get_page", { format: "compact" }),
+        await mcpx.getToolSchema("docs__get_page", { name: "secrets__read" }),
+        await mcpx.getToolSchema("docs__get_page", "compact"),
+      ];
+    `);
+    expect(outcome).toEqual({
+      status: "completed",
+      result: JSON.stringify([
+        { op: "schema", payload: { name: "docs__get_page" } },
+        {
+          op: "schema",
+          payload: { format: "compact", name: "docs__get_page" },
+        },
+        { op: "schema", payload: { name: "docs__get_page" } },
+        { op: "schema", payload: { name: "docs__get_page" } },
+      ]),
+    });
+  });
+
   it("brokers structured requests and returns the script's JSON value", async () => {
     const { outcome, logs } = await run(`
       const [call, servers] = await Promise.all([

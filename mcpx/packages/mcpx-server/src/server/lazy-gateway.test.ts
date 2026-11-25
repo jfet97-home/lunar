@@ -990,6 +990,104 @@ describe("lazy Streamable HTTP gateway", () => {
     }
   });
 
+  it("returns the full schema unchanged by default and a compact view on request, for visible tools only", async () => {
+    const issue: ToolEntry = {
+      serverName: "jira",
+      capabilityName: "create_issue",
+      origin: "upstream",
+      definition: {
+        name: "jira__create_issue",
+        description: "Create a Jira issue",
+        inputSchema: {
+          type: "object",
+          $defs: {
+            Fields: {
+              type: "object",
+              properties: {
+                labels: { type: "array", items: { type: "string" } },
+              },
+              additionalProperties: true,
+            },
+          },
+          properties: {
+            project: {
+              type: "string",
+              pattern: "^[A-Z]+$",
+              description: "Project key",
+            },
+            type: { enum: ["Bug", "Task"] },
+            fields: { $ref: "#/$defs/Fields" },
+          },
+          required: ["project", "type"],
+        },
+        outputSchema: {
+          type: "object",
+          properties: { key: { type: "string" } },
+        },
+        annotations: { destructiveHint: false },
+      },
+    };
+    const harness = await makeHarness({
+      entries: [
+        makeEntry("docs", "get_page", ALLOWED_NAME),
+        makeEntry("secrets", "read", DENIED_NAME),
+        makeEntry("legacy", "fetch", INACTIVE_NAME),
+        makeEntry("oauth", "grant", HIDDEN_NAME, "internal"),
+        issue,
+      ],
+    });
+    try {
+      const { client } = await harness.connectClient("/mcp/lazy");
+      const lookup = (args: Record<string, unknown>) =>
+        client.callTool({ name: "mcpx_get_tool_schema", arguments: args });
+      const advertised = (await client.listTools()).tools.find(
+        (tool) => tool.name === "mcpx_get_tool_schema",
+      );
+      expect(advertised?.inputSchema.properties?.["format"]).toMatchObject({
+        enum: ["full", "compact"],
+        default: "full",
+      });
+
+      const full = await lookup({ name: issue.definition.name });
+      expect(full.isError).toBeFalsy();
+      expect(resultText(full)).toBe(JSON.stringify(issue.definition));
+      expect(
+        resultText(
+          await lookup({ name: issue.definition.name, format: "full" }),
+        ),
+      ).toBe(resultText(full));
+
+      const compact = await lookup({
+        name: issue.definition.name,
+        format: "compact",
+      });
+      expect(compact.isError).toBeFalsy();
+      expect(JSON.parse(resultText(compact))).toEqual({
+        name: "jira__create_issue",
+        format: "compact",
+        description: "Create a Jira issue",
+        annotations: { destructiveHint: false },
+        inputType:
+          '{ /** Project key */ project: string; type: "Bug" | "Task"; fields?: { labels?: string[]; [key: string]: unknown } }',
+        complete: false,
+        omitted: ["pattern"],
+      });
+      expect(resultText(compact).length).toBeLessThan(resultText(full).length);
+
+      const unavailable = resultText(await lookup({ name: "missing__tool" }));
+      for (const name of [DENIED_NAME, HIDDEN_NAME, INACTIVE_NAME]) {
+        const hidden = await lookup({ name, format: "compact" });
+        expect(hidden.isError).toBe(true);
+        expect(resultText(hidden)).toBe(unavailable);
+      }
+      const invalid = await lookup({ name: ALLOWED_NAME, format: "brief" });
+      expect(invalid.isError).toBe(true);
+      expect(harness.upstreamCallTool).not.toHaveBeenCalled();
+    } finally {
+      await harness.close();
+    }
+  });
+
   it("reports read-only eligibility as unavailable when Code Mode is not available", async () => {
     const harness = await makeHarness();
     try {
@@ -2161,6 +2259,80 @@ describe("Code Mode on the gateway endpoints", () => {
       await harness.close();
     }
   });
+
+  it.each([
+    ["mcpx_execute", "/mcp"],
+    ["mcpx_execute", "/mcp/lazy"],
+    ["mcpx_execute_readonly", "/mcp"],
+    ["mcpx_execute_readonly", "/mcp/lazy"],
+  ] as const)(
+    "serves full and compact schemas to %s scripts on %s with the normal visibility checks",
+    async (toolName, endpoint) => {
+      const harness = await makeHarness({
+        entries: entries(),
+        codeMode: codeMode(),
+      });
+      try {
+        const { client } = await harness.connectClient(endpoint);
+        harness.entries.push(makeEntry("newsrv", "lookup", "newsrv__lookup"));
+        const result = await client.callTool({
+          name: toolName,
+          arguments: {
+            code: `
+              const full = await mcpx.getToolSchema("${ALLOWED_NAME}");
+              const explicit = await mcpx.getToolSchema("${ALLOWED_NAME}", { format: "full" });
+              const compact = await mcpx.getToolSchema("${ALLOWED_NAME}", { format: "compact" });
+              const fresh = await mcpx.getToolSchema("newsrv__lookup", { format: "compact" });
+              const errors = {};
+              for (const [name, format] of [["${HIDDEN_NAME}", "compact"], ["${DENIED_NAME}", "compact"], ["${INACTIVE_NAME}", "compact"], ["${ALLOWED_NAME}", "ts"]]) {
+                try { await mcpx.getToolSchema(name, { format }); } catch (error) { errors[name + ":" + format] = error.code; }
+              }
+              // the summary checks nothing; MCPX passes arguments as they are
+              const call = await mcpx.callTool("${ALLOWED_NAME}", { id: 42 });
+              return { full, explicit, compact, fresh, errors, called: !call.isError };
+            `,
+          },
+        });
+        const output = JSON.parse(resultText(result));
+        expect(output.ok).toBe(true);
+        expect(output.result).toEqual({
+          full: makeTool(ALLOWED_NAME),
+          explicit: makeTool(ALLOWED_NAME),
+          compact: {
+            name: ALLOWED_NAME,
+            format: "compact",
+            description: `Read ${ALLOWED_NAME}`,
+            inputType: "{ id: string }",
+            complete: true,
+          },
+          fresh: {
+            name: "newsrv__lookup",
+            format: "compact",
+            description: "Read newsrv__lookup",
+            inputType: "{ id: string }",
+            complete: true,
+          },
+          errors: {
+            [`${HIDDEN_NAME}:compact`]: "invalid_request",
+            [`${DENIED_NAME}:compact`]: "invalid_request",
+            [`${INACTIVE_NAME}:compact`]: "invalid_request",
+            [`${ALLOWED_NAME}:ts`]: "invalid_request",
+          },
+          called: true,
+        });
+        expect(harness.upstreamCallTool).toHaveBeenCalledTimes(1);
+        expect(harness.upstreamCallTool).toHaveBeenCalledWith(
+          "docs",
+          expect.objectContaining({
+            name: "get_page",
+            arguments: { id: 42 },
+          }),
+        );
+      } finally {
+        await harness.close();
+      }
+    },
+  );
 
   it("reaches tools registered after the session started", async () => {
     const harness = await makeHarness({

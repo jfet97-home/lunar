@@ -179,6 +179,110 @@ describe("lazy tool discovery", () => {
     });
   });
 
+  it("returns the full definition unchanged by default and with format full", async () => {
+    const definition: Tool = {
+      ...tool("svc__read", "d".repeat(5000)),
+      title: "Read",
+      outputSchema: { type: "object", properties: { ok: { type: "boolean" } } },
+      annotations: { readOnlyHint: true },
+      _meta: { vendor: "x" },
+    };
+    for (const args of [
+      { name: "svc__read" },
+      { name: "svc__read", format: "full" },
+    ]) {
+      expect(
+        await resolveLazyToolRequest(request("mcpx_get_tool_schema", args), [
+          definition,
+        ]),
+      ).toEqual({
+        kind: "result",
+        result: {
+          content: [{ type: "text", text: JSON.stringify(definition) }],
+        },
+      });
+    }
+  });
+
+  it("returns a bounded compact view derived from the visible input schema", async () => {
+    const definition: Tool = {
+      name: "tracker__create_issue",
+      title: "t".repeat(1000),
+      description: "Create an issue. ".repeat(100),
+      inputSchema: {
+        type: "object",
+        properties: {
+          title: { type: "string", description: "Issue title" },
+          priority: { type: "integer", minimum: 1 },
+        },
+        required: ["title"],
+      },
+      outputSchema: { type: "object" },
+      annotations: {
+        destructiveHint: false,
+        internalNote: "private",
+      } as NonNullable<Tool["annotations"]>,
+      _meta: { secretHint: "x" },
+    };
+    const result = await resolveLazyToolRequest(
+      request("mcpx_get_tool_schema", {
+        name: "tracker__create_issue",
+        format: "compact",
+      }),
+      [definition],
+    );
+    if (result.kind !== "result") throw new Error("unexpected execution");
+    const text = result.result.content[0];
+    if (text?.type !== "text") throw new Error("expected discovery text");
+    expect(result.result.isError).toBeUndefined();
+    expect(JSON.parse(text.text)).toEqual({
+      name: "tracker__create_issue",
+      format: "compact",
+      title: `${"t".repeat(297)}...`,
+      description: `${"Create an issue. ".repeat(100).slice(0, 297)}...`,
+      annotations: { destructiveHint: false },
+      inputType: "{ /** Issue title */ title: string; priority?: number }",
+      complete: false,
+      omitted: ["minimum", "integer"],
+    });
+    expect(text.text).not.toMatch(
+      /inputSchema|outputSchema|internalNote|_meta/,
+    );
+
+    const bare = await resolveLazyToolRequest(
+      request("mcpx_get_tool_schema", { name: "svc__ping", format: "compact" }),
+      [{ name: "svc__ping", inputSchema: { type: "object" } }],
+    );
+    expect(bare).toEqual({
+      kind: "result",
+      result: {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              name: "svc__ping",
+              format: "compact",
+              inputType: "{}",
+              complete: true,
+            }),
+          },
+        ],
+      },
+    });
+  });
+
+  it.each([{ format: "typescript" }, { format: null }, { compact: true }])(
+    "rejects an unsupported schema lookup option %j",
+    async (option) => {
+      expect(
+        await resolveLazyToolRequest(
+          request("mcpx_get_tool_schema", { name: "svc__read", ...option }),
+          [tool("svc__read")],
+        ),
+      ).toMatchObject({ kind: "result", result: { isError: true } });
+    },
+  );
+
   it("filters read-only eligibility over the unfiltered ranking with accurate paging", async () => {
     const catalog = ["svc__write", "svc__read", "svc__drop", "svc__list"].map(
       (name) => tool(name),
@@ -290,11 +394,15 @@ describe("lazy tool discovery", () => {
     });
   });
 
-  it.each(["mcpx_get_tool_schema", "mcpx_call_tool"])(
-    "does not reveal or execute unavailable tools through %s",
-    async (name) => {
+  it.each([
+    ["mcpx_get_tool_schema", {}],
+    ["mcpx_get_tool_schema", { format: "compact" }],
+    ["mcpx_call_tool", {}],
+  ])(
+    "does not reveal or execute unavailable tools through %s %j",
+    async (name, extra) => {
       const result = await resolveLazyToolRequest(
-        request(name, { name: "denied__secret" }),
+        request(name, { name: "denied__secret", ...extra }),
         [tool("allowed__read")],
       );
       expect(result).toMatchObject({

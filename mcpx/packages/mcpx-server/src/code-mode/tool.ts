@@ -16,7 +16,8 @@ export const CODE_MODE_RESERVED_TOOL_NAMES: ReadonlySet<string> = new Set([
 
 const SCRIPT_INTERFACE = [
   "`code` is the body of an async function: use await and return a JSON-serializable value.",
-  "Use await mcpx.listServers(), await mcpx.searchTools(query, { limit, offset, readOnly }), and await mcpx.getToolSchema(name) to discover tools.",
+  "Use await mcpx.listServers(), await mcpx.searchTools(query, { limit, offset, readOnly }), and await mcpx.getToolSchema(name, { format }) to discover tools.",
+  'With { format: "compact" }, getToolSchema returns an informational TypeScript-like inputType instead of the full schema; when its complete field is false, get the full schema for exact constraints.',
   "Search results include readOnlyEligibility. Set readOnly to true to find only tools eligible for mcpx_execute_readonly.",
   "await mcpx.callTool(name, args) returns { isError, content, structuredContent, text, data }. The data field contains structuredContent or parsed JSON text.",
   "mcpx.describe(value) returns a bounded description of its types, keys, and array lengths.",
