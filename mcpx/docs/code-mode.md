@@ -31,13 +31,13 @@ const pages = await Promise.all(
 return pages.map((result) => result.text.slice(0, 500));
 ```
 
-| Function                                     | Returns                                                                               |
-| -------------------------------------------- | ------------------------------------------------------------------------------------- |
-| `mcpx.listServers()`                         | The `mcpx_list_servers` result for the caller.                                        |
-| `mcpx.searchTools(query, { limit, offset })` | The `mcpx_search_tools` result: names, descriptions and annotations, without schemas. |
-| `mcpx.getToolSchema(name)`                   | One full tool definition, fetched on demand.                                          |
-| `mcpx.callTool(name, args)`                  | `{ isError, content, structuredContent, text, data }`.                                |
-| `mcpx.describe(value)`                       | A bounded description of the value's shape, without its values. Runs in the script.   |
+| Function                                               | Returns                                                                                                      |
+| ------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `mcpx.listServers()`                                   | The `mcpx_list_servers` result for the caller.                                                               |
+| `mcpx.searchTools(query, { limit, offset, readOnly })` | The `mcpx_search_tools` result: names, descriptions, annotations and read-only eligibility, without schemas. |
+| `mcpx.getToolSchema(name)`                             | One full tool definition, fetched on demand.                                                                 |
+| `mcpx.callTool(name, args)`                            | `{ isError, content, structuredContent, text, data }`.                                                       |
+| `mcpx.describe(value)`                                 | A bounded description of the value's shape, without its values. Runs in the script.                          |
 
 `text` joins the result's text blocks. `data` is `structuredContent` when the tool
 returns it, otherwise the text parsed as JSON, otherwise `undefined`. A tool-level
@@ -231,6 +231,21 @@ read-only tool never asks for approval inside the script. With no trust lists
 configured, only built-in read-only tools run. The result carries
 `readOnly: true`; each allowed call reports `approval: "trusted_read"` and each
 refusal `status: "rejected"` with `errorCode: "read_only_blocked"`.
+
+To find the tools that this tool runs before calling them, search with
+`readOnly: true`. Each search result carries `readOnlyEligibility`, the same
+decision for that tool, with a reason when it is not eligible:
+
+```js
+const reads = await mcpx.searchTools("jira issue", { readOnly: true });
+const issue = reads.tools.find((tool) => tool.name === "jira__get_issue");
+if (!issue) return (await mcpx.searchTools("jira__get_issue")).tools;
+return (await mcpx.callTool(issue.name, { key: "PROJ-1" })).data;
+```
+
+The search is advice: the call is still classified when it runs. See
+[read-only eligibility](lazy-tools.md#read-only-eligibility) for the reasons,
+paging and older gateways.
 
 The tool is annotated `readOnlyHint: true` and `destructiveHint: false`, so a
 client can give it a separate approval rule, such as auto-approving it while it

@@ -32,7 +32,8 @@ summarize inside MCPX and return only the final value. Its `code` is an async
 function body that calls `mcpx.searchTools`, `mcpx.getToolSchema` and
 `mcpx.callTool`; `mcpx.describe` shows a result's shape without its values.
 When `mcpx_execute_readonly` is advertised, prefer it for read-only work: it
-runs only inner calls that the gateway trusts as reads. Read
+runs only inner calls that the gateway trusts as reads. Search with
+`readOnly: true` to find the tools it accepts before writing the script. Read
 [Code Mode](references/code-mode.md) for the script API, result report, byte
 counts, approval prompts, read-only refusals and limits. Use ordinary calls for
 a single simple operation.

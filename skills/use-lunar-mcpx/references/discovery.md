@@ -26,6 +26,22 @@ The default limit is five and the maximum is twenty. If relevant results are mis
 refine the service/task query or use `offset` with a returned `nextOffset`. Keep
 paging bounded to the user's task. Schema retrieval precedes execution.
 
+## Read-only eligibility
+
+Newer gateways add `readOnlyEligibility` to each search result. It is the
+gateway's own decision whether `mcpx_execute_readonly` would run that tool now,
+for example `{"eligible": false, "reason": "declares_write"}`. Other reasons are
+`not_trusted` (the operator does not trust it as a read), `reserved` (a gateway
+wrapper) and `unavailable` (this gateway has no read-only execution).
+`annotations` stay the upstream's own hints; a `readOnlyHint` alone does not make
+a tool eligible. Add `"readOnly": true` to return only eligible tools;
+`totalMatches` and `nextOffset` then count only those. Search without it to see
+why a tool was left out.
+
+Eligibility is not a permission: the read-only tool checks each call again when
+it runs. Older gateways have no such field and reject `readOnly` as an
+unrecognized argument. Treat a missing field as unknown, not as eligible.
+
 Server listing uses visible tool metadata. Disabled, blocked or inactive services
 can be absent; a service awaiting authentication can appear if its login tool is
 visible. Permissions are checked again when tools are called.
