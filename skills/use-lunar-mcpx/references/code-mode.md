@@ -33,13 +33,12 @@ call `mcpx_execute` or `mcpx_call_tool` from inside a script.
 
 ## Approvals
 
-Each inner call keeps the caller's permissions. Calls that the gateway operator
-has not marked as trusted reads, including most writes, need the user's approval
-of the exact tool and arguments. The client shows that prompt; never answer it or
-claim it on the user's behalf. A declined or unanswered prompt means the call did
-not run. If the client cannot show prompts, the script gets
-`approval_unsupported`; call the tool directly instead so that the client's own
-approval flow applies.
+Each inner call keeps the caller's gateway permissions. Normally the client
+applies its approval policy to `mcpx_execute` and the script runs without
+additional prompts. An operator can enable per-call approval for calls other
+than trusted reads. In that mode, the client asks the user to approve the exact
+tool and arguments. A declined or unanswered prompt stops that call. If the
+client cannot show the prompt, the script gets `approval_unsupported`.
 
 ## Read the result
 

@@ -95,7 +95,14 @@ existing upstream OAuth connections, and records the normal per-call
 `tool_used` audit event, metrics and usage. Scripts cannot choose the identity,
 headers, metadata or approval state of a call.
 
-A call runs without a prompt only when trusted gateway policy says it is a read:
+By default, the client applies its normal policy to `mcpx_execute` and MCPX
+adds no approval prompts inside the script. An unattended client can run
+allowed tools, including writes, without waiting for a person. The client's
+policy sees one `mcpx_execute` call. Use MCPX permissions to restrict which
+individual tools the script can call.
+
+An operator can enable `CODE_MODE_REQUIRE_TOOL_APPROVAL=true` to require
+separate approval inside scripts. In that mode, trusted reads skip the prompt:
 
 - built-in MCPX tools that MCPX itself defines as read-only;
 - tool names that the operator lists in `CODE_MODE_TRUSTED_READ_TOOLS`;
@@ -116,7 +123,8 @@ to the resolved tool, its definition, its server configuration, its upstream aut
 generation and the caller. If any of them changed while the prompt was open,
 the call does not run (`target_changed`).
 
-Clients without form elicitation get `approval_unsupported` for calls that need
+In per-call approval mode, clients without form elicitation get
+`approval_unsupported` for calls that need
 approval; nothing runs. Use the tool directly in that case, so that the client's
 own tool-approval flow applies. A gateway restart restores sessions without the
 client's capabilities, so such a session also fails closed until the client
@@ -165,12 +173,14 @@ is not interrupted. It is reported as `in_flight` with an unknown outcome.
 | Variable                                                                                                                    | Default    | Effect                                                                                                       |
 | --------------------------------------------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------------ |
 | `ENABLE_CODE_MODE`                                                                                                          | `true`     | Advertise and serve `mcpx_execute`.                                                                          |
+| `CODE_MODE_REQUIRE_TOOL_APPROVAL`                                                                                           | `false`    | Ask for approval inside scripts for calls that are not trusted reads.                                        |
 | `CODE_MODE_TRUSTED_READ_TOOLS`                                                                                              | empty      | Comma-separated tool names that run without approval. `*` matches any characters, for example `docs__get_*`. |
 | `CODE_MODE_TRUSTED_ANNOTATION_SERVERS`                                                                                      | empty      | Comma-separated server names (or `*` patterns) whose `readOnlyHint` annotations MCPX trusts.                 |
 | `CODE_MODE_CPU_MS`, `CODE_MODE_WALL_MS`, `CODE_MODE_MEMORY_MB`, `CODE_MODE_MAX_TOOL_CALLS`, `CODE_MODE_APPROVAL_TIMEOUT_MS` | see limits | Budget overrides.                                                                                            |
 
-List only tools that cannot change state. A broad pattern trusts future tools
-with matching names too.
+The trust lists apply only when per-call approval is enabled. List only tools
+that cannot change state. A broad pattern trusts future tools with matching
+names too.
 
 ## Known limits
 

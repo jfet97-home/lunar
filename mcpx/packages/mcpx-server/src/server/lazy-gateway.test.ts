@@ -1261,10 +1261,11 @@ describe("Code Mode on the gateway endpoints", () => {
     else process.env["INSTANCE_ID"] = previousInstanceId;
   });
 
-  function codeMode(): CodeModeService {
+  function codeMode(requireToolApproval = true): CodeModeService {
     return new CodeModeService(
       {
         enabled: true,
+        requireToolApproval,
         runnerPath,
         limits: { ...DEFAULT_CODE_MODE_LIMITS, wallMs: 15_000 },
         trust: {
@@ -1412,6 +1413,40 @@ describe("Code Mode on the gateway endpoints", () => {
       await harness.close();
     }
   });
+
+  it.each(["/mcp", "/mcp/lazy"] as const)(
+    "runs allowed writes without elicitation in client-managed mode on %s",
+    async (endpoint) => {
+      const harness = await makeHarness({
+        entries: entries(),
+        codeMode: codeMode(false),
+      });
+      try {
+        const { client } = await harness.connectClient(endpoint);
+        const output = await execute(
+          client,
+          `
+            const write = await mcpx.callTool("${WRITE_NAME}", { title: "Mock write" });
+            let denied;
+            try { await mcpx.callTool("${DENIED_NAME}", {}); }
+            catch (error) { denied = error.code; }
+            return { write: write.isError, denied };
+          `,
+        );
+        expect(output.result).toEqual({
+          write: false,
+          denied: "permission_denied",
+        });
+        expect(harness.upstreamCallTool).toHaveBeenCalledTimes(1);
+        expect(harness.auditLog).toHaveBeenCalledWith({
+          eventType: "tool_used",
+          payload: expect.objectContaining({ toolName: "create_issue" }),
+        });
+      } finally {
+        await harness.close();
+      }
+    },
+  );
 
   it("asks the user per write and dispatches only the exact approved call", async () => {
     const harness = await makeHarness({

@@ -16,6 +16,7 @@ import z from "zod/v4";
 
 export interface CodeModeEnv {
   ENABLE_CODE_MODE: boolean;
+  CODE_MODE_REQUIRE_TOOL_APPROVAL: boolean;
   CODE_MODE_TRUSTED_READ_TOOLS: string[];
   CODE_MODE_TRUSTED_ANNOTATION_SERVERS: string[];
   CODE_MODE_CPU_MS: number;
@@ -27,6 +28,7 @@ export interface CodeModeEnv {
 
 export interface CodeModeOverrides {
   enabled?: boolean;
+  requireToolApproval?: boolean;
   runnerPath?: string;
   limits?: Partial<CodeModeLimits>;
   trust?: Partial<CodeModeTrustPolicy>;
@@ -38,6 +40,8 @@ export function codeModeConfigFromEnv(
 ): CodeModeConfig {
   return {
     enabled: overrides.enabled ?? env.ENABLE_CODE_MODE,
+    requireToolApproval:
+      overrides.requireToolApproval ?? env.CODE_MODE_REQUIRE_TOOL_APPROVAL,
     runnerPath: overrides.runnerPath,
     limits: {
       ...DEFAULT_CODE_MODE_LIMITS,
@@ -82,7 +86,7 @@ export class CodeModeService {
     logger: Logger,
   ) {
     this.logger = logger.child({ component: "CodeMode" });
-    this.tool = buildCodeModeTool(config.limits);
+    this.tool = buildCodeModeTool(config.limits, config.requireToolApproval);
     this.available =
       config.enabled &&
       config.runnerPath !== undefined &&
@@ -125,7 +129,7 @@ export class CodeModeService {
         limits: this.config.limits,
         trust: this.config.trust,
         gateway: props.gateway,
-        approve: props.approve,
+        approve: this.config.requireToolApproval ? props.approve : undefined,
         signal: props.signal,
         logger: this.logger,
         executionId: randomUUID(),

@@ -98,8 +98,8 @@ See the [tool discovery guide](mcpx/docs/lazy-tools.md) for search pagination, l
 Both endpoints also advertise `mcpx_execute`. It runs a short JavaScript program
 in an isolated sandbox inside MCPX, so a client can discover tools, call them,
 and filter large intermediate results without passing each result through the
-model. Each inner call keeps the caller's permissions and audit, and calls that
-may change data ask the user to approve the exact arguments through the client.
+model. The client controls approval of `mcpx_execute`. Each inner call keeps
+the caller's gateway permissions and audit.
 See the [Code Mode guide](mcpx/docs/code-mode.md) for the script interface,
 approval policy, isolation, and limits.
 

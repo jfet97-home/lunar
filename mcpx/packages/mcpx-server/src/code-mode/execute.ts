@@ -97,7 +97,7 @@ interface ExecuteCodeProps {
   limits: CodeModeLimits;
   trust: CodeModeTrustPolicy;
   gateway: CodeModeGateway;
-  approve: ApprovalRequester;
+  approve?: ApprovalRequester;
   signal?: AbortSignal;
   logger: Logger;
   executionId: string;
@@ -179,7 +179,7 @@ export async function executeCode(
         definition: resolved.definition,
         trust,
       });
-      if (classification.kind === "approval-required") {
+      if (approve && classification.kind === "approval-required") {
         report.status = "awaiting_approval";
         const releaseApproval = await approvals.acquire(stopped);
         if (!releaseApproval) return failure("cancelled", "The script stopped");
@@ -218,7 +218,7 @@ export async function executeCode(
           return failure(decision.code, decision.message);
         }
         report.approval = "user_approved";
-      } else {
+      } else if (approve) {
         report.approval = "trusted_read";
       }
       if (stopped.aborted) {

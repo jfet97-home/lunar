@@ -33,6 +33,7 @@ export interface CodeModeTrustPolicy {
 
 export interface CodeModeConfig {
   enabled: boolean;
+  requireToolApproval: boolean;
   runnerPath?: string;
   limits: CodeModeLimits;
   trust: CodeModeTrustPolicy;

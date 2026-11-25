@@ -94,6 +94,7 @@ const envSchema = z
     ENABLE_TOOL_CALL_CACHE: z.stringbool().default(false),
     // Code Mode: mcpx_execute runs scripts in an isolated runner process.
     ENABLE_CODE_MODE: z.stringbool().default(true),
+    CODE_MODE_REQUIRE_TOOL_APPROVAL: z.stringbool().default(false),
     // Exact tool names or `*` patterns the operator trusts as read-only.
     CODE_MODE_TRUSTED_READ_TOOLS: commaSeparatedStringArraySchema.default([]),
     // Servers whose readOnlyHint annotations the operator trusts.
@@ -222,6 +223,7 @@ const NON_SECRET_KEYS = [
   "DOWNSTREAM_KEEPALIVE_INTERVAL_MS",
   "ENABLE_TOOL_CALL_CACHE",
   "ENABLE_CODE_MODE",
+  "CODE_MODE_REQUIRE_TOOL_APPROVAL",
   "CODE_MODE_TRUSTED_READ_TOOLS",
   "CODE_MODE_TRUSTED_ANNOTATION_SERVERS",
   "CODE_MODE_CPU_MS",

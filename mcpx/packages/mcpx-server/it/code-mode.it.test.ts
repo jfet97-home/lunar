@@ -253,6 +253,7 @@ describe("Code Mode through the full gateway", () => {
       })),
       clientConnectExtraHeaders: { "x-lunar-consumer-tag": "agents" },
       codeMode: {
+        requireToolApproval: true,
         runnerPath: path.resolve(process.cwd(), "src/code-mode/runner.ts"),
         limits: { wallMs: 20_000 },
         trust: {
