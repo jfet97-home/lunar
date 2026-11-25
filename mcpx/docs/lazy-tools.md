@@ -58,18 +58,19 @@ it works for every tool, including tools added after the session started:
 
 ```text
 mcpx_get_tool_schema({"name": "jira__create_issue", "format": "compact"})
-→ {"name":"jira__create_issue","format":"compact","description":"Create a Jira issue","annotations":{"destructiveHint":false},"inputType":"{ /** Project key */ project: string; type: \"Bug\" | \"Task\"; fields?: { labels?: string[]; [key: string]: unknown } }","complete":false,"omitted":["pattern"]}
+→ {"name":"jira__create_issue","format":"compact","description":"Create a Jira issue","annotations":{"destructiveHint":false},"required":["project","type"],"inputType":"{ /** Project key */ project: string; type: \"Bug\" | \"Task\"; fields?: { labels?: string[]; [key: string]: unknown } }","complete":false,"omitted":["pattern"]}
 ```
 
-| Field                  | Content                                                                                      |
-| ---------------------- | -------------------------------------------------------------------------------------------- |
-| `name`                 | The exact tool name. Use it unchanged in `mcpx_call_tool`.                                   |
-| `format`               | Always `"compact"`. A full definition has no such field.                                     |
-| `title`, `description` | Present when the tool has them, cut to 300 characters. A cut text ends with `...`.           |
-| `annotations`          | The upstream hints, as in search results.                                                    |
-| `inputType`            | A TypeScript-like type of the `arguments` object.                                            |
-| `complete`             | `true` when the renderer detects no omissions in the compact view.                           |
-| `omitted`              | Present when `complete` is `false`: the keywords and cuts that `inputType` does not include. |
+| Field                  | Content                                                                                           |
+| ---------------------- | ------------------------------------------------------------------------------------------------- |
+| `name`                 | The exact tool name. Use it unchanged in `mcpx_call_tool`.                                        |
+| `format`               | Always `"compact"`. A full definition has no such field.                                          |
+| `title`, `description` | Present when the tool has them, cut to 300 characters. A cut text ends with `...`.                |
+| `annotations`          | The upstream hints, as in search results.                                                         |
+| `required`             | The schema's top-level required names, when the list is nonempty and fits in 512 JSON characters. |
+| `inputType`            | A TypeScript-like type of the `arguments` object.                                                 |
+| `complete`             | `true` when the renderer detects no omissions in the compact view.                                |
+| `omitted`              | Present when `complete` is `false`: the keywords and cuts that `inputType` does not include.      |
 
 `inputType` shows property names, `?` for optional properties, types, nested
 objects and arrays, enums and constants, unions (`anyOf`, `oneOf`),

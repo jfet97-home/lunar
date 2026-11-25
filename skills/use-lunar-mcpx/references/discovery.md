@@ -34,8 +34,12 @@ unchanged.
 
 ```text
 mcpx_get_tool_schema({"name": "<exact name>", "format": "compact"})
--> {"name":"<exact name>","format":"compact","description":"...","inputType":"{ id: string; mode?: \"raw\" | \"html\" }","complete":true}
+-> {"name":"<exact name>","format":"compact","description":"...","required":["id"],"inputType":"{ id: string; mode?: \"raw\" | \"html\" }","complete":true}
 ```
+
+When present, `required` lists the argument names declared in the schema's
+top-level `required` list. Nested details can be cut from `inputType` without
+removing that list. Fetch the full schema for conditional or nested constraints.
 
 `inputType` is a TypeScript-like summary of the `arguments` object: names, `?`
 for optional properties, types, nested objects, arrays and enums. `complete` is

@@ -15,6 +15,7 @@
  */
 
 export interface CompactInputType {
+  required?: string[];
   inputType: string;
   /*
    * True when the renderer detects no omissions in the compact view.
@@ -28,6 +29,7 @@ const LIMITS = {
   depth: 20,
   nodes: 500,
   chars: 4_000,
+  requiredChars: 512,
   // a summary that still ends longer becomes unknown
   maxChars: 5_000,
   // entries examined in one list of properties, required names or values
@@ -131,11 +133,35 @@ const NULL_VALUES: ReadonlySet<string> = new Set(["null"]);
 
 export function compactInputType(schema: unknown): CompactInputType {
   const renderer = new Renderer(schema);
-  const inputType = renderer.renderRoot();
+  const required = topLevelRequired(schema);
+  const input = {
+    ...(required ? { required } : {}),
+    inputType: renderer.renderRoot(),
+  };
   const omitted = renderer.omittedLabels();
   return omitted.length === 0
-    ? { inputType, complete: true }
-    : { inputType, complete: false, omitted };
+    ? { ...input, complete: true }
+    : { ...input, complete: false, omitted };
+}
+
+function topLevelRequired(schema: unknown): string[] | undefined {
+  if (!isRecord(schema) || schema["type"] !== "object") return undefined;
+  const names = schema["required"];
+  if (!Array.isArray(names) || !names.length || names.length > LIMITS.entries) {
+    return undefined;
+  }
+
+  const required: string[] = [];
+  let remaining = LIMITS.requiredChars - 2;
+  for (const name of names) {
+    if (typeof name !== "string" || name.length > LIMITS.nameChars) {
+      return undefined;
+    }
+    remaining -= JSON.stringify(name).length + (required.length ? 1 : 0);
+    if (remaining < 0) return undefined;
+    required.push(name);
+  }
+  return required;
 }
 
 class Renderer {

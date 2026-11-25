@@ -241,6 +241,7 @@ describe("lazy tool discovery", () => {
       title: `${"t".repeat(297)}...`,
       description: `${"Create an issue. ".repeat(100).slice(0, 297)}...`,
       annotations: { destructiveHint: false },
+      required: ["title"],
       inputType: "{ /** Issue title */ title: string; priority?: number }",
       complete: false,
       omitted: ["minimum", "integer"],

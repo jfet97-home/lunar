@@ -49,6 +49,7 @@ describe("compact input type", () => {
         additionalProperties: false,
       }),
     ).toEqual({
+      required: ["id"],
       inputType:
         '{ /** Page id */ id: string; mode?: "raw" | "html"; verbose?: boolean }',
       complete: true,
@@ -115,6 +116,7 @@ describe("compact input type", () => {
         required: ["tags", "kind", "token"],
       }),
     ).toEqual({
+      required: ["tags", "kind", "token"],
       inputType:
         "{ tags: string[]; " +
         'filters?: { field: string; op?: "eq" | "ne" | 1 | true | null }[]; ' +
@@ -470,6 +472,7 @@ describe("compact input type", () => {
     });
     const assignee = "{ accountId: string; email?: string }";
     expect(result).toEqual({
+      required: ["project"],
       inputType:
         "{ /** Project key, such as OPS * / or DEV */ project: string; " +
         'priority?: "low" | "high"; ' +
@@ -532,6 +535,43 @@ describe("compact input type", () => {
         "anyOf",
       ],
     });
+  });
+
+  it("keeps required top-level names visible when nested arguments fill the budget", () => {
+    const result = compactInputType({
+      type: "object",
+      properties: {
+        environment_slug: { type: "string" },
+        query_spec: {
+          type: "object",
+          properties: Object.fromEntries(
+            Array.from({ length: 500 }, (_, i) => [
+              `parameter${i}`,
+              { type: "string", description: "An optional query parameter" },
+            ]),
+          ),
+          required: ["parameter0"],
+        },
+        team: { type: "string" },
+      },
+      required: ["environment_slug", "query_spec", "team"],
+    });
+
+    expect(result).toMatchObject({
+      required: ["environment_slug", "query_spec", "team"],
+      complete: false,
+      omitted: ["size limit"],
+    });
+    expect(result.inputType.length).toBeLessThanOrEqual(HARD_MAX_CHARS);
+  });
+
+  it("omits the separate list when the full list would exceed its budget", () => {
+    const required = Array.from({ length: 5 }, (_, index) =>
+      String(index).padEnd(128, '"'),
+    );
+    expect(
+      compactInputType({ type: "object", required }).required,
+    ).toBeUndefined();
   });
 
   it("counts nested output once, so a nested schema fills its whole budget", () => {
