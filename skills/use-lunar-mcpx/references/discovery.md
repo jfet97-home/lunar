@@ -39,9 +39,9 @@ mcpx_get_tool_schema({"name": "<exact name>", "format": "compact"})
 
 `inputType` is a TypeScript-like summary of the `arguments` object: names, `?`
 for optional properties, types, nested objects, arrays and enums. `complete` is
-`true` only when it accepts the same arguments as the schema; an object type
-without `[key: string]` does not say whether other properties are accepted.
-Otherwise `omitted` lists what differs, for example `pattern`, `minimum`,
+`true` when the renderer detects no omissions. Use the full schema for exact
+validation rules, including whether undeclared object properties are accepted.
+When `complete` is `false`, `omitted` lists differences such as `pattern`, `minimum`,
 `integer` (shown as `number`), `oneOf` when alternatives can overlap, or
 `size limit` when the summary was cut.
 

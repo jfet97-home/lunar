@@ -17,9 +17,8 @@
 export interface CompactInputType {
   inputType: string;
   /*
-   * True only when inputType accepts the same arguments as the schema. An
-   * object type without an index signature does not say whether undeclared
-   * properties are accepted.
+   * True when the renderer detects no omissions in the compact view.
+   * Use the full schema for exact validation rules.
    */
   complete: boolean;
   omitted?: string[];

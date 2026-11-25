@@ -68,7 +68,7 @@ mcpx_get_tool_schema({"name": "jira__create_issue", "format": "compact"})
 | `title`, `description` | Present when the tool has them, cut to 300 characters. A cut text ends with `...`.           |
 | `annotations`          | The upstream hints, as in search results.                                                    |
 | `inputType`            | A TypeScript-like type of the `arguments` object.                                            |
-| `complete`             | `true` only when `inputType` accepts the same arguments as the input schema; see below.      |
+| `complete`             | `true` when the renderer detects no omissions in the compact view.                           |
 | `omitted`              | Present when `complete` is `false`: the keywords and cuts that `inputType` does not include. |
 
 `inputType` shows property names, `?` for optional properties, types, nested
@@ -87,12 +87,13 @@ properties, and `complete` does not depend on it. A tuple shows `minItems` and
 `maxItems` with required and optional elements and a rest element, as in
 `[string, number?, ...boolean[]]`.
 
-`complete` is `false` whenever `inputType` could accept a value that the schema
-rejects, or reject one that it accepts. For example, a `oneOf` shows as a union
-only when no value can match two of its alternatives: alternatives of different
-types, distinct literals, or objects with distinct literal values of a required
-property. Otherwise `omitted` lists `oneOf`, because a value that matches two
-alternatives fails the schema but not the union.
+`complete` reports whether the renderer detected an omitted constraint or cut.
+Use the full schema when exact validation matters. For example, a `oneOf` is
+marked incomplete unless the renderer can establish that its alternatives
+are disjoint, such as distinct literal values on a required property. A plain
+union cannot express that the schema rejects values matching two alternatives.
+Compact references use local pointers and combine sibling constraints. Use the
+full schema for dialect-specific reference behavior.
 
 `omitted` names each keyword that the type cannot express, such as
 `minLength`, `pattern`, `format`, `minimum` or `integer`, and the reason for
