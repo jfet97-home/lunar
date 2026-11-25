@@ -7,6 +7,10 @@ is built into MCPX and uses the same authentication, upstream connections,
 permissions, and sessions. The existing `/mcp` and `/sse` endpoints remain
 available for clients that need the complete catalog.
 
+When Code Mode is enabled, both endpoints also advertise `mcpx_execute`, which
+runs a script that chains these operations server-side. See the
+[Code Mode guide](code-mode.md).
+
 ## Discovery and execution
 
 1. Call `mcpx_list_servers` with no arguments at the start of the session. It

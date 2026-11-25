@@ -43,6 +43,7 @@ import { buildAdminRouter } from "../src/server/admin.js";
 import { buildIdentityRouter } from "../src/server/identity.js";
 import { buildSkillsRouter } from "../src/server/skills.js";
 import { buildOAuthRouter } from "../src/server/oauth-router.js";
+import { CodeModeOverrides } from "../src/code-mode/service.js";
 
 const MCPX_PORT = 9523;
 export const MCPX_BASE_URL = `http://localhost:${MCPX_PORT}`;
@@ -336,8 +337,11 @@ interface TestHarnessProps {
   mcpxPort?: number;
   hubPort?: number;
   behaviorPayload?: SetMcpxBehaviorPayload;
+  codeMode?: CodeModeOverrides;
 }
-function defaultTestHarnessProps(): Required<TestHarnessProps> {
+function defaultTestHarnessProps(): Required<
+  Omit<TestHarnessProps, "codeMode">
+> {
   return {
     config: buildConfig(),
     authGuard: noOpAuthGuard,
@@ -368,6 +372,7 @@ export function getTestHarness(props: TestHarnessProps = {}): TestHarness {
     mcpxPort,
     hubPort: requestedHubPort,
     behaviorPayload,
+    codeMode,
   } = {
     ...defaultTestHarnessProps(),
     ...props,
@@ -380,6 +385,7 @@ export function getTestHarness(props: TestHarnessProps = {}): TestHarness {
   const meterProvider = new MeterProvider();
   const services = new Services(config, meterProvider, testLogger, {
     hubUrl: `http://localhost:${hubPort}`,
+    codeMode,
   });
 
   const client = new Client({ name: "end-client", version: "1.0.0" });

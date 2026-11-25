@@ -1,8 +1,14 @@
 import { createServer, Server as HttpServer } from "node:http";
+import path from "node:path";
 import express, { RequestHandler } from "express";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { Tool } from "@modelcontextprotocol/sdk/types.js";
+import {
+  ElicitRequest,
+  ElicitRequestSchema,
+  ElicitResult,
+  Tool,
+} from "@modelcontextprotocol/sdk/types.js";
 import { noOpLogger } from "@aigw/core/logging";
 import { McpxSession } from "../model/sessions.js";
 import { BehaviorSetting } from "../services/behavior-service.js";
@@ -14,6 +20,8 @@ import {
 } from "../services/internal-capabilities-service.js";
 import { CapabilityRegistry } from "../services/capability-registry.js";
 import { PermissionCheck } from "../services/capability-resolver.js";
+import { CodeModeService } from "../code-mode/service.js";
+import { DEFAULT_CODE_MODE_LIMITS } from "../code-mode/policy.js";
 
 let buildDownstreamTransportsRouter: (typeof import("./downstream-transports.js"))["buildDownstreamTransportsRouter"];
 
@@ -53,6 +61,7 @@ interface HarnessOptions {
   toolResult?: unknown;
   onCallTool?: (...args: unknown[]) => Promise<unknown>;
   authVersions?: Map<string, number>;
+  codeMode?: CodeModeService;
   management?: {
     services: Pick<
       Services,
@@ -76,9 +85,12 @@ interface Harness {
   systemStateTracker: {
     recordToolCall: jest.Mock;
   };
+  services: Services;
+  entries: ToolEntry[];
   connectClient: (
     path: "/mcp" | "/mcp/lazy",
     authorization?: string,
+    options?: { elicit?: (request: ElicitRequest) => Promise<ElicitResult> },
   ) => Promise<{
     client: Client;
     transport: StreamableHTTPClientTransport;
@@ -272,6 +284,7 @@ async function makeHarness(options: HarnessOptions = {}): Promise<Harness> {
     metricRecorder: { recordToolCallDuration: jest.fn() },
     hubService: { recordToolCall: jest.fn() },
     catalogManager: { getCatalog: () => options.catalog ?? [] },
+    codeMode: options.codeMode ?? { available: false },
   } as unknown as Services;
 
   const app = express();
@@ -306,8 +319,23 @@ async function makeHarness(options: HarnessOptions = {}): Promise<Harness> {
     upstreamCallTool,
     auditLog,
     systemStateTracker: { recordToolCall },
-    connectClient: async (path, authorization = "Bearer test-token") => {
-      const client = new Client({ name: "gateway-test", version: "1.0.0" });
+    services,
+    entries,
+    connectClient: async (
+      path,
+      authorization = "Bearer test-token",
+      clientOptions = {},
+    ) => {
+      const { elicit } = clientOptions;
+      const client = new Client(
+        { name: "gateway-test", version: "1.0.0" },
+        elicit ? { capabilities: { elicitation: { form: {} } } } : undefined,
+      );
+      if (elicit) {
+        client.setRequestHandler(ElicitRequestSchema, (request) =>
+          elicit(request),
+        );
+      }
       const transport = new StreamableHTTPClientTransport(
         new URL(path, baseUrl),
         {
@@ -1204,6 +1232,417 @@ describe("lazy Streamable HTTP gateway", () => {
       expect(correctMode.status).toBe(200);
       expect(harness.sessions.get("lazy-session")?.metadata.toolMode).toBe(
         "lazy",
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+});
+
+describe("Code Mode on the gateway endpoints", () => {
+  jest.setTimeout(30_000);
+  const runnerPath = path.resolve(process.cwd(), "src/code-mode/runner.ts");
+  const WRITE_NAME = "tracker__create_issue";
+  const previousVersion = process.env["VERSION"];
+  const previousInstanceId = process.env["INSTANCE_ID"];
+
+  beforeAll(async () => {
+    process.env["VERSION"] = "test";
+    process.env["INSTANCE_ID"] = "test-instance";
+    ({ buildDownstreamTransportsRouter } = await import(
+      "./downstream-transports.js"
+    ));
+  });
+
+  afterAll(() => {
+    if (previousVersion === undefined) delete process.env["VERSION"];
+    else process.env["VERSION"] = previousVersion;
+    if (previousInstanceId === undefined) delete process.env["INSTANCE_ID"];
+    else process.env["INSTANCE_ID"] = previousInstanceId;
+  });
+
+  function codeMode(requireToolApproval = true): CodeModeService {
+    return new CodeModeService(
+      {
+        enabled: true,
+        requireToolApproval,
+        runnerPath,
+        limits: { ...DEFAULT_CODE_MODE_LIMITS, wallMs: 15_000 },
+        trust: {
+          trustedReadTools: ["docs__*", "newsrv__*"],
+          trustedAnnotationServers: [],
+        },
+      },
+      noOpLogger,
+    );
+  }
+
+  function entries(): ToolEntry[] {
+    return [
+      makeEntry("docs", "get_page", ALLOWED_NAME),
+      makeEntry("tracker", "create_issue", WRITE_NAME),
+      makeEntry("secrets", "read", DENIED_NAME),
+      makeEntry("legacy", "fetch", INACTIVE_NAME),
+      makeEntry("oauth", "grant", HIDDEN_NAME, "internal"),
+    ];
+  }
+
+  async function execute(client: Client, code: string) {
+    const result = await client.callTool({
+      name: "mcpx_execute",
+      arguments: { code },
+    });
+    return JSON.parse(resultText(result)) as {
+      ok: boolean;
+      result?: unknown;
+      error?: { code: string };
+      calls: Record<string, unknown>[];
+    };
+  }
+
+  const approveOnce = (
+    answers: ElicitResult[],
+    seen: ElicitRequest[] = [],
+    beforeAnswer: () => void = () => {},
+  ) =>
+    async function elicit(request: ElicitRequest): Promise<ElicitResult> {
+      seen.push(request);
+      beforeAnswer();
+      return answers.shift() ?? { action: "decline" };
+    };
+
+  it("announces mcpx_execute in tools/list and instructions on both endpoints and keeps normal calls", async () => {
+    const harness = await makeHarness({
+      entries: entries(),
+      codeMode: codeMode(),
+    });
+    try {
+      const catalog = await harness.connectClient("/mcp");
+      const lazy = await harness.connectClient("/mcp/lazy");
+      const catalogNames = (await catalog.client.listTools()).tools.map(
+        (tool) => tool.name,
+      );
+      expect(catalogNames).toEqual(
+        expect.arrayContaining([ALLOWED_NAME, WRITE_NAME, "mcpx_execute"]),
+      );
+      expect(
+        (await lazy.client.listTools()).tools.map((tool) => tool.name),
+      ).toEqual([
+        "mcpx_list_servers",
+        "mcpx_search_tools",
+        "mcpx_get_tool_schema",
+        "mcpx_call_tool",
+        "mcpx_execute",
+      ]);
+      expect(catalog.client.getInstructions()).toContain("mcpx_execute");
+      expect(lazy.client.getInstructions()).toContain("mcpx_execute");
+      expect(lazy.client.getInstructions()).toContain("mcpx_list_servers");
+
+      await catalog.client.callTool({
+        name: ALLOWED_NAME,
+        arguments: { id: "direct" },
+      });
+      expect(harness.upstreamCallTool).toHaveBeenCalledWith(
+        "docs",
+        expect.objectContaining({
+          name: "get_page",
+          arguments: { id: "direct" },
+        }),
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("chains discovery and calls through normal dispatch with the caller's identity and audit", async () => {
+    const harness = await makeHarness({
+      entries: entries(),
+      codeMode: codeMode(),
+      onCallTool: async (_server, params) => ({
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              id: (params as { arguments: { id: string } }).arguments.id,
+              links: ["b", "c"],
+            }),
+          },
+        ],
+      }),
+    });
+    try {
+      const { client } = await harness.connectClient(
+        "/mcp/lazy",
+        "Bearer caller-token",
+      );
+      const output = await execute(
+        client,
+        `
+          const servers = await mcpx.listServers();
+          const found = await mcpx.searchTools("${ALLOWED_NAME}");
+          const schema = await mcpx.getToolSchema(found.tools[0].name);
+          const root = await mcpx.callTool(schema.name, { id: "a" });
+          const next = await mcpx.callTool(schema.name, { id: root.data.links[0] });
+          return { servers: servers.servers.map((s) => s.name), ids: [root.data.id, next.data.id] };
+        `,
+      );
+      expect(output.ok).toBe(true);
+      expect(output.result).toEqual({
+        servers: ["docs", "tracker"],
+        ids: ["a", "b"],
+      });
+      expect(harness.upstreamCallTool).toHaveBeenCalledTimes(2);
+      expect(harness.upstreamCallTool).toHaveBeenNthCalledWith(2, "docs", {
+        name: "get_page",
+        arguments: { id: "b" },
+        _meta: { authorization: "Bearer caller-token" },
+      });
+      expect(harness.auditLog).toHaveBeenCalledWith({
+        eventType: "tool_used",
+        payload: expect.objectContaining({
+          targetServerName: "docs",
+          toolName: "get_page",
+          args: { id: "b" },
+          consumerTag: "test-consumer",
+        }),
+      });
+      expect(harness.systemStateTracker.recordToolCall).toHaveBeenCalledTimes(
+        2,
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it.each(["/mcp", "/mcp/lazy"] as const)(
+    "runs allowed writes without elicitation in client-managed mode on %s",
+    async (endpoint) => {
+      const harness = await makeHarness({
+        entries: entries(),
+        codeMode: codeMode(false),
+      });
+      try {
+        const { client } = await harness.connectClient(endpoint);
+        const output = await execute(
+          client,
+          `
+            const write = await mcpx.callTool("${WRITE_NAME}", { title: "Mock write" });
+            let denied;
+            try { await mcpx.callTool("${DENIED_NAME}", {}); }
+            catch (error) { denied = error.code; }
+            return { write: write.isError, denied };
+          `,
+        );
+        expect(output.result).toEqual({
+          write: false,
+          denied: "permission_denied",
+        });
+        expect(harness.upstreamCallTool).toHaveBeenCalledTimes(1);
+        expect(harness.auditLog).toHaveBeenCalledWith({
+          eventType: "tool_used",
+          payload: expect.objectContaining({ toolName: "create_issue" }),
+        });
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+
+  it("asks the user per write and dispatches only the exact approved call", async () => {
+    const harness = await makeHarness({
+      entries: entries(),
+      codeMode: codeMode(),
+    });
+    const seen: ElicitRequest[] = [];
+    try {
+      const { client } = await harness.connectClient("/mcp", undefined, {
+        elicit: approveOnce(
+          [{ action: "accept", content: { approve: true } }],
+          seen,
+        ),
+      });
+      const output = await execute(
+        client,
+        `
+          const first = await mcpx.callTool("${WRITE_NAME}", { title: "Approved" });
+          let second;
+          try {
+            await mcpx.callTool("${WRITE_NAME}", { title: "Approved" });
+          } catch (error) {
+            second = error.code;
+          }
+          return { first: first.isError, second };
+        `,
+      );
+      expect(output.result).toEqual({
+        first: false,
+        second: "approval_declined",
+      });
+      expect(seen).toHaveLength(2);
+      expect(seen[0]?.params.message).toContain(`Tool: ${WRITE_NAME}`);
+      expect(seen[0]?.params.message).toContain('"title": "Approved"');
+      expect(harness.upstreamCallTool).toHaveBeenCalledTimes(1);
+      expect(harness.upstreamCallTool).toHaveBeenCalledWith("tracker", {
+        name: "create_issue",
+        arguments: { title: "Approved" },
+        _meta: { authorization: "Bearer test-token" },
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("fails closed for clients without elicitation and for hidden, denied, inactive or wrapper tools", async () => {
+    const harness = await makeHarness({
+      entries: entries(),
+      codeMode: codeMode(),
+    });
+    try {
+      const { client } = await harness.connectClient("/mcp/lazy");
+      const output = await execute(
+        client,
+        `
+          const codes = [];
+          for (const name of ["${WRITE_NAME}", "${DENIED_NAME}", "${INACTIVE_NAME}", "${HIDDEN_NAME}", "mcpx_execute", "mcpx_search_tools"]) {
+            try { await mcpx.callTool(name, {}); } catch (error) { codes.push(error.code); }
+          }
+          const hidden = await mcpx.searchTools("${HIDDEN_NAME}");
+          return { codes, hidden: hidden.totalMatches };
+        `,
+      );
+      expect(output.result).toEqual({
+        codes: [
+          "approval_unsupported",
+          "permission_denied",
+          "server_inactive",
+          "not_available",
+          "recursion_blocked",
+          "recursion_blocked",
+        ],
+        hidden: 0,
+      });
+      const wrapped = await client.callTool({
+        name: "mcpx_call_tool",
+        arguments: { name: "mcpx_execute", arguments: { code: "return 1" } },
+      });
+      expect(wrapped.isError).toBe(true);
+      expect(harness.upstreamCallTool).not.toHaveBeenCalled();
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it.each([
+    ["auth generation", "target_changed"],
+    ["server target", "target_changed"],
+  ])(
+    "does not dispatch an approved call when its %s changed during approval",
+    async (change, code) => {
+      const authVersions = new Map<string, number>();
+      const harness = await makeHarness({
+        entries: entries(),
+        codeMode: codeMode(),
+        authVersions,
+      });
+      try {
+        const mutate = (): void => {
+          if (change === "auth generation") authVersions.set("tracker", 1);
+          if (change === "server target") {
+            const client =
+              harness.services.upstreamHandler.clientsByService.get(
+                "tracker",
+              ) as unknown as { targetServer: { url: string } };
+            client.targetServer = {
+              ...client.targetServer,
+              url: "https://replacement.example.com/mcp",
+            };
+          }
+        };
+        const { client } = await harness.connectClient("/mcp", undefined, {
+          elicit: approveOnce(
+            [{ action: "accept", content: { approve: true } }],
+            [],
+            mutate,
+          ),
+        });
+        const output = await execute(
+          client,
+          `try { await mcpx.callTool("${WRITE_NAME}", { title: "x" }); } catch (error) { return error.code; }`,
+        );
+        expect(output.result).toBe(code);
+        expect(harness.upstreamCallTool).not.toHaveBeenCalled();
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+
+  it.each([
+    ["closes", "session_closed"],
+    ["changes its authorization", "identity_changed"],
+  ])(
+    "runs no further inner call after the calling session %s",
+    async (change, code) => {
+      const harness: Awaited<ReturnType<typeof makeHarness>> =
+        await makeHarness({
+          entries: entries(),
+          codeMode: codeMode(),
+          onCallTool: async () => {
+            for (const [id, session] of harness.sessions) {
+              if (change === "closes") harness.sessions.delete(id);
+              else
+                session.metadata = {
+                  ...session.metadata,
+                  authorization: "Bearer other",
+                };
+            }
+            return { content: [{ type: "text", text: "{}" }] };
+          },
+        });
+      try {
+        const { client } = await harness.connectClient("/mcp");
+        const output = await execute(
+          client,
+          `
+            await mcpx.callTool("${ALLOWED_NAME}", { id: "1" });
+            const codes = [];
+            for (const run of [
+              () => mcpx.callTool("${ALLOWED_NAME}", { id: "2" }),
+              () => mcpx.searchTools("${ALLOWED_NAME}"),
+            ]) {
+              try { await run(); } catch (error) { codes.push(error.code); }
+            }
+            return codes;
+          `,
+        );
+        expect(output.result).toEqual([code, code]);
+        expect(harness.upstreamCallTool).toHaveBeenCalledTimes(1);
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+
+  it("reaches tools registered after the session started", async () => {
+    const harness = await makeHarness({
+      entries: entries(),
+      codeMode: codeMode(),
+    });
+    try {
+      const { client } = await harness.connectClient("/mcp/lazy");
+      harness.entries.push(makeEntry("newsrv", "lookup", "newsrv__lookup"));
+      const output = await execute(
+        client,
+        `
+          const found = await mcpx.searchTools("newsrv__lookup");
+          await mcpx.callTool(found.tools[0].name, { id: "1" });
+          return found.tools.map((tool) => tool.name);
+        `,
+      );
+      expect(output.result).toEqual(["newsrv__lookup"]);
+      expect(harness.upstreamCallTool).toHaveBeenCalledWith(
+        "newsrv",
+        expect.objectContaining({ name: "lookup", arguments: { id: "1" } }),
       );
     } finally {
       await harness.close();

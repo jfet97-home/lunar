@@ -1,6 +1,6 @@
 ---
 name: use-lunar-mcpx
-description: Use an existing Lunar MCPX connection to discover upstream services and tools, inspect their schemas, execute authorized calls, and diagnose connection or sign-in problems through advertised management tools. For gateway usage, not source development, Docker deployment, upgrades, or credential migration.
+description: Use an existing Lunar MCPX connection to discover upstream services and tools, inspect their schemas, execute authorized calls, chain and filter calls server-side with mcpx_execute, and diagnose connection or sign-in problems through advertised management tools. For gateway usage, not source development, Docker deployment, upgrades, or credential migration.
 ---
 
 # Use Lunar MCPX
@@ -24,6 +24,16 @@ Read [discovery and execution](references/discovery.md) for payload examples, pa
 full-endpoint behavior and handling uncertain results. Search a small shortlist
 rather than loading the complete catalog. Do not invent target names or arguments.
 
+## Chain calls server-side
+
+When `mcpx_execute` is advertised, use it for multi-step work whose intermediate
+results are large or only needed to choose the next call: list, filter, join or
+summarize inside MCPX and return only the final value. Its `code` is an async
+function body that calls `mcpx.searchTools`, `mcpx.getToolSchema` and
+`mcpx.callTool`. Read [Code Mode](references/code-mode.md) for the script API,
+result report, approval prompts and limits. Use ordinary calls for a single
+simple operation.
+
 If an upstream service exposes its own discovery mechanism, use its returned
 instructions and schemas to discover the specific operation before executing it.
 Resolve required account, project or resource identifiers from actual results;
@@ -45,4 +55,6 @@ Present user-facing sign-in URLs and device codes when the provider requires the
 
 Distinguish a tool being found, a connection being available, authorization being
 completed and the actual upstream call succeeding. For writes, uncertain transport
-outcomes require reconciliation rather than blindly repeating the operation.
+outcomes require reconciliation rather than blindly repeating the operation. This
+also applies to the per-call report of `mcpx_execute`; MCPX never retries a call
+or a script by itself.
