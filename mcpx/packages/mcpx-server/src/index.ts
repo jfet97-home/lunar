@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { z } from "zod/v4";
 import {
   ConfigService,
@@ -136,7 +137,14 @@ async function main(): Promise<void> {
   const meterProvider = startMetricsEndpoint(
     logger.child({ component: "Metrics" }),
   );
-  const services = new Services(configService, meterProvider, logger);
+  const services = new Services(configService, meterProvider, logger, {
+    // the compiled runner sits next to this entrypoint
+    codeMode: {
+      runnerPath: fileURLToPath(
+        new URL("./code-mode/runner.js", import.meta.url),
+      ),
+    },
+  });
   await services.initialize();
   services.systemStateTracker.setMcpxVersion(env.VERSION);
   GracefulShutdown.registerCleanup("services", () => services.shutdown());

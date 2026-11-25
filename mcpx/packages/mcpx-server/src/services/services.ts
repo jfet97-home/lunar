@@ -60,9 +60,15 @@ import {
   getLocalImportOptions,
   LocalImportService,
 } from "./local-import-service.js";
+import {
+  CodeModeOverrides,
+  CodeModeService,
+  codeModeConfigFromEnv,
+} from "../code-mode/service.js";
 
 export interface ServicesOptions {
   hubUrl?: string;
+  codeMode?: CodeModeOverrides;
 }
 
 export class Services {
@@ -92,6 +98,7 @@ export class Services {
   private _localSavedSetups: LocalSavedSetups;
   private _localExportService: LocalExportService;
   private _localImportService: LocalImportService;
+  private _codeMode: CodeModeService;
 
   private logger: TelemetryLogger;
   private initialized = false;
@@ -105,6 +112,10 @@ export class Services {
     this._config = config;
     const startupLogger = logger.child({ component: "Services" });
     this._localImportService = new LocalImportService(getLocalImportOptions());
+    this._codeMode = new CodeModeService(
+      codeModeConfigFromEnv(env, options.codeMode),
+      logger,
+    );
 
     const homeDirectory = homedir();
     const configuredPath = (
@@ -750,5 +761,9 @@ export class Services {
   get localImportService(): LocalImportService {
     this.ensureInitialized();
     return this._localImportService;
+  }
+
+  get codeMode(): CodeModeService {
+    return this._codeMode;
   }
 }

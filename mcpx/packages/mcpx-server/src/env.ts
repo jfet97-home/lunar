@@ -92,6 +92,22 @@ const envSchema = z
     NOTIFICATION_STREAM_RECONNECT_GRACE_MS: z.coerce.number().default(15_000),
     DOWNSTREAM_KEEPALIVE_INTERVAL_MS: z.coerce.number().default(25000),
     ENABLE_TOOL_CALL_CACHE: z.stringbool().default(false),
+    // Code Mode: mcpx_execute runs scripts in an isolated runner process.
+    ENABLE_CODE_MODE: z.stringbool().default(true),
+    // Exact tool names or `*` patterns the operator trusts as read-only.
+    CODE_MODE_TRUSTED_READ_TOOLS: commaSeparatedStringArraySchema.default([]),
+    // Servers whose readOnlyHint annotations the operator trusts.
+    CODE_MODE_TRUSTED_ANNOTATION_SERVERS:
+      commaSeparatedStringArraySchema.default([]),
+    CODE_MODE_CPU_MS: z.coerce.number().int().positive().default(5_000),
+    CODE_MODE_WALL_MS: z.coerce.number().int().positive().default(300_000),
+    CODE_MODE_MEMORY_MB: z.coerce.number().int().positive().default(64),
+    CODE_MODE_MAX_TOOL_CALLS: z.coerce.number().int().positive().default(50),
+    CODE_MODE_APPROVAL_TIMEOUT_MS: z.coerce
+      .number()
+      .int()
+      .positive()
+      .default(120_000),
     TOOL_CALL_CACHE_TTL_MS: z.coerce.number().default(5 * 60_000),
     TOOL_CALL_CACHE_MAX_ENTRIES: z.coerce.number().default(1000),
     ENABLE_STREAMABLE_EVENT_STORE: z.stringbool().default(false),
@@ -205,6 +221,14 @@ const NON_SECRET_KEYS = [
   "NOTIFICATION_STREAM_RECONNECT_GRACE_MS",
   "DOWNSTREAM_KEEPALIVE_INTERVAL_MS",
   "ENABLE_TOOL_CALL_CACHE",
+  "ENABLE_CODE_MODE",
+  "CODE_MODE_TRUSTED_READ_TOOLS",
+  "CODE_MODE_TRUSTED_ANNOTATION_SERVERS",
+  "CODE_MODE_CPU_MS",
+  "CODE_MODE_WALL_MS",
+  "CODE_MODE_MEMORY_MB",
+  "CODE_MODE_MAX_TOOL_CALLS",
+  "CODE_MODE_APPROVAL_TIMEOUT_MS",
   "TOOL_CALL_CACHE_TTL_MS",
   "TOOL_CALL_CACHE_MAX_ENTRIES",
   "ENABLE_STREAMABLE_EVENT_STORE",

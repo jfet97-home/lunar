@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { makeError, stableStringify } from "@aigw/core/data";
 import { loggableError } from "@aigw/core/logging";
 import { measureNonFailable } from "@aigw/core/time";
@@ -5,6 +6,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequest,
   CallToolRequestSchema,
+  ElicitResultSchema,
   EmptyResultSchema,
   GetPromptRequestSchema,
   ListPromptsRequestSchema,
@@ -29,6 +31,7 @@ import {
 import { enabledCapabilityKinds } from "../services/capability-registry.js";
 import {
   ActiveCapability,
+  ActiveTool,
   ConsumerContext,
   UnavailableReason,
 } from "../services/capability-resolver.js";
@@ -48,6 +51,20 @@ import {
 import { LocalToolSearch } from "../services/local-tool-search.js";
 import { normalizeServerName } from "@mcpx/toolkit-core/data";
 import { isConnected } from "../services/target-client-types.js";
+import {
+  createElicitationApprover,
+  supportsFormElicitation,
+} from "../code-mode/approval.js";
+import {
+  CodeModeGateway,
+  GatewayRejectionCode,
+  ResolvedCall,
+} from "../code-mode/execute.js";
+import {
+  CATALOG_INSTRUCTIONS,
+  CODE_MODE_INSTRUCTIONS,
+  CODE_MODE_TOOL_NAME,
+} from "../code-mode/tool.js";
 const toolSearches = new WeakMap<Services, LocalToolSearch>();
 const MIN_PROTOCOL_VERSION_FOR_KEEPALIVE = "2025-11-25";
 const MAX_KEEPALIVE_TIMEOUT_RATIO = 0.8;
@@ -78,11 +95,20 @@ export async function getServer(
   for (const kind of enabledKinds) {
     capabilities[kind] = { listChanged: true };
   }
+  const codeMode = services.codeMode;
+  const instructions =
+    toolMode === "lazy"
+      ? codeMode.available
+        ? `${LAZY_INSTRUCTIONS} ${CODE_MODE_INSTRUCTIONS}`
+        : LAZY_INSTRUCTIONS
+      : codeMode.available
+        ? CATALOG_INSTRUCTIONS
+        : undefined;
   const server = new Server(
     { name: "mcpx", version: "1.0.0" },
     {
       capabilities,
-      ...(toolMode === "lazy" ? { instructions: LAZY_INSTRUCTIONS } : {}),
+      ...(instructions ? { instructions } : {}),
     },
   );
   if (shouldReturnEmptyServer) {
@@ -97,21 +123,24 @@ export async function getServer(
 
       const permittedTools =
         services.capabilityResolver.getPermittedTools(consumer);
+      const codeModeTools = codeMode.available ? [codeMode.tool] : [];
       if (toolMode === "lazy") {
         const managementTools = listLazyManagementTools(
           permittedTools,
           consumer,
           services,
         );
-        return { tools: [...LAZY_TOOLS, ...managementTools] };
+        return {
+          tools: [...LAZY_TOOLS, ...codeModeTools, ...managementTools],
+        };
       }
 
-      const tools: Tool[] = listVisibleDefinitions(
-        permittedTools,
-        consumer,
-        (cap, consumer) =>
+      const tools: Tool[] = [
+        ...listVisibleDefinitions(permittedTools, consumer, (cap, consumer) =>
           services.internalCapabilities.visibleToolForListing(cap, consumer),
-      );
+        ),
+        ...codeModeTools,
+      ];
 
       if (logger.isSillyEnabled()) {
         logger.debug("ListToolsRequest response", { tools });
@@ -271,40 +300,50 @@ export async function getServer(
   server.setRequestHandler(
     CallToolRequestSchema,
     async (request, { sessionId, sendNotification, sendRequest, signal }) => {
-      if (toolMode === "lazy") {
-        const consumer = services.sessions.getConsumerContext(sessionId);
-        const permittedTools =
-          services.capabilityResolver.getPermittedTools(consumer);
-        const visibleTools = listVisibleDefinitions(
-          permittedTools,
-          consumer,
-          (cap, context) =>
-            services.internalCapabilities.visibleToolForListing(cap, context),
-        );
-        const directManagementToolNames = new Set(
-          listLazyManagementTools(permittedTools, consumer, services).map(
-            (tool) => tool.name,
-          ),
-        );
-        const existingSearch = toolSearches.get(services);
-        const search = existingSearch ?? new LocalToolSearch(logger);
-        if (!existingSearch) {
-          toolSearches.set(services, search);
+      if (codeMode.available && request.params.name === CODE_MODE_TOOL_NAME) {
+        const keepaliveStopper = setupDownstreamKeepalive({
+          request,
+          supportsKeepalive: supportsDownstreamKeepalive(services, sessionId),
+          supportsPing: supportsDownstreamPing(services, sessionId),
+          sendNotification,
+          sendRequest,
+          signal,
+          logger,
+        });
+        try {
+          return await codeMode.execute({
+            args: request.params.arguments ?? {},
+            gateway: buildCodeModeGateway({ services, sessionId, logger }),
+            approve: createElicitationApprover({
+              supported: () =>
+                supportsFormElicitation(server.getClientCapabilities()),
+              send: ({ params, signal, timeoutMs }) =>
+                sendRequest(
+                  { method: "elicitation/create", params },
+                  ElicitResultSchema,
+                  { signal, timeout: timeoutMs },
+                ),
+              maxArgumentsChars:
+                codeMode.config.limits.maxApprovalArgumentsChars,
+            }),
+            signal,
+          });
+        } finally {
+          keepaliveStopper();
         }
+      }
+      if (toolMode === "lazy") {
+        const discovery = lazyDiscoveryContext({
+          services,
+          sessionId,
+          logger,
+        });
         const resolved = await resolveLazyToolRequest(
           request,
-          visibleTools,
-          (tools, query) => search.search(tools, query),
-          () => {
-            const visibleNames = new Set(visibleTools.map((tool) => tool.name));
-            const serverNames = new Set(
-              permittedTools
-                .filter((cap) => visibleNames.has(cap.definition.name))
-                .map((cap) => cap.serverName),
-            );
-            return listVisibleLazyServers(services, serverNames);
-          },
-          directManagementToolNames,
+          discovery.visibleTools,
+          discovery.search,
+          discovery.listServers,
+          discovery.directManagementToolNames,
         );
         if (resolved.kind === "result") return resolved.result;
         request = resolved.request;
@@ -390,6 +429,230 @@ export async function getServer(
   );
 
   return server;
+}
+
+function lazyDiscoveryContext(props: {
+  services: Services;
+  sessionId: string | undefined;
+  logger: Logger;
+}): {
+  visibleTools: Tool[];
+  search: (tools: Tool[], query: string) => Promise<Tool[]>;
+  listServers: () => LazyServer[];
+  directManagementToolNames: Set<string>;
+} {
+  const { services, sessionId, logger } = props;
+  const consumer = services.sessions.getConsumerContext(sessionId);
+  const permittedTools =
+    services.capabilityResolver.getPermittedTools(consumer);
+  const visibleTools = listVisibleDefinitions(
+    permittedTools,
+    consumer,
+    (cap, context) =>
+      services.internalCapabilities.visibleToolForListing(cap, context),
+  );
+  const directManagementToolNames = new Set(
+    listLazyManagementTools(permittedTools, consumer, services).map(
+      (tool) => tool.name,
+    ),
+  );
+  const existingSearch = toolSearches.get(services);
+  const search = existingSearch ?? new LocalToolSearch(logger);
+  if (!existingSearch) {
+    toolSearches.set(services, search);
+  }
+  return {
+    visibleTools,
+    search: (tools, query) => search.search(tools, query),
+    listServers: (): LazyServer[] => {
+      const visibleNames = new Set(visibleTools.map((tool) => tool.name));
+      const serverNames = new Set(
+        permittedTools
+          .filter((cap) => visibleNames.has(cap.definition.name))
+          .map((cap) => cap.serverName),
+      );
+      return listVisibleLazyServers(services, serverNames);
+    },
+    directManagementToolNames,
+  };
+}
+
+/*
+ * Code Mode's view of the gateway for one outer call. The caller identity is
+ * captured when the call starts; every later operation fails closed if the
+ * session closed or its consumer, client or authorization changed, so inner
+ * calls never fall back to an anonymous consumer. Inner calls then use the same
+ * resolver, visibility, dispatch, metrics and audit path as a direct call.
+ */
+function buildCodeModeGateway(props: {
+  services: Services;
+  sessionId: string | undefined;
+  logger: Logger;
+}): CodeModeGateway {
+  const { services, sessionId, logger } = props;
+  const startSession = sessionId
+    ? services.sessions.getSession(sessionId)
+    : undefined;
+  const identity = {
+    consumerTag: startSession?.metadata.consumerTag,
+    clientName: startSession?.metadata.clientInfo.name,
+    authorization: startSession?.metadata.authorization,
+  };
+  const consumer: ConsumerContext = {
+    consumerTag: identity.consumerTag,
+    clientName: identity.clientName,
+  };
+  const identityProblem = (): Extract<ResolvedCall, { ok: false }> | null => {
+    if (!sessionId) return null;
+    const session = services.sessions.getSession(sessionId);
+    if (!startSession || !session) {
+      return {
+        ok: false,
+        code: "session_closed",
+        message: "The calling session is closed; no further calls run",
+      };
+    }
+    if (
+      session.metadata.consumerTag !== identity.consumerTag ||
+      session.metadata.clientInfo.name !== identity.clientName ||
+      session.metadata.authorization !== identity.authorization
+    ) {
+      return {
+        ok: false,
+        code: "identity_changed",
+        message:
+          "The calling session's identity or authorization changed; no further calls run",
+      };
+    }
+    return null;
+  };
+  const resolveEntry = (
+    name: string,
+  ):
+    | Extract<ResolvedCall, { ok: false }>
+    | (Extract<ResolvedCall, { ok: true }> & { entry: ActiveTool }) => {
+    const problem = identityProblem();
+    if (problem) return problem;
+    const resolved = services.capabilityResolver.resolveToolCall(
+      name,
+      consumer,
+    );
+    if (!resolved.ok) {
+      return {
+        ok: false,
+        code: rejectionCode(resolved.reason),
+        message: makeUnavailableError("Tool", name, resolved.reason).message,
+      };
+    }
+    const { entry } = resolved;
+    const definition =
+      entry.origin === "internal"
+        ? services.internalCapabilities.visibleToolForListing(entry, consumer)
+        : entry.definition;
+    if (!definition) {
+      return {
+        ok: false,
+        code: "not_available",
+        message: makeUnavailableError("Tool", name, "unknown").message,
+      };
+    }
+    const target = services.upstreamHandler.clientsByService.get(
+      entry.serverName,
+    )?.targetServer;
+    const binding = createHash("sha256")
+      .update(
+        stableStringify({
+          name,
+          serverName: entry.serverName,
+          capabilityName: entry.capabilityName,
+          origin: entry.origin,
+          definition,
+          authVersion: services.upstreamHandler.getAuthVersion(
+            entry.serverName,
+          ),
+          target: target ?? null,
+          identity,
+        }),
+      )
+      .digest("hex");
+    return {
+      ok: true,
+      serverName: entry.serverName,
+      origin: entry.origin,
+      definition,
+      binding,
+      entry,
+    };
+  };
+  return {
+    discover: async (tool, args): ReturnType<CodeModeGateway["discover"]> => {
+      const problem = identityProblem();
+      if (problem) return problem;
+      const discovery = lazyDiscoveryContext({ services, sessionId, logger });
+      const resolved = await resolveLazyToolRequest(
+        { method: "tools/call", params: { name: tool, arguments: args } },
+        discovery.visibleTools,
+        discovery.search,
+        discovery.listServers,
+      );
+      return resolved.kind === "result"
+        ? resolved.result
+        : {
+            content: [{ type: "text", text: "Unsupported discovery request" }],
+            isError: true,
+          };
+    },
+    resolve: (name): ResolvedCall => {
+      const resolved = resolveEntry(name);
+      if (!resolved.ok) return resolved;
+      const { entry: _entry, ...call } = resolved;
+      return call;
+    },
+    dispatch: async (
+      name,
+      args,
+      binding,
+    ): ReturnType<CodeModeGateway["dispatch"]> => {
+      const resolved = resolveEntry(name);
+      if (!resolved.ok) {
+        return {
+          kind: "rejected",
+          code: resolved.code,
+          message: resolved.message,
+        };
+      }
+      if (resolved.binding !== binding) {
+        return {
+          kind: "rejected",
+          code: "target_changed",
+          message:
+            "The tool, its server, its authorization or the session changed after the call was classified or approved, so it did not run",
+        };
+      }
+      // the verified entry runs directly, with no further name lookup
+      const result = await executeResolvedToolCall({
+        services,
+        sessionId,
+        request: { method: "tools/call", params: { name, arguments: args } },
+        entry: resolved.entry,
+        clientName: identity.clientName,
+        consumerTag: identity.consumerTag,
+        authorization: identity.authorization,
+      });
+      return { kind: "result", result };
+    },
+  };
+}
+
+function rejectionCode(reason: UnavailableReason): GatewayRejectionCode {
+  switch (reason) {
+    case "permission-denied":
+      return "permission_denied";
+    case "server-inactive":
+      return "server_inactive";
+    case "unknown":
+      return "not_available";
+  }
 }
 
 function supportsDownstreamPing(
@@ -539,14 +802,7 @@ async function executeToolCall(options: {
   consumerTag: string | undefined;
   authorization: string | undefined;
 }): Promise<ToolCallResultUnion> {
-  const {
-    services,
-    sessionId,
-    request,
-    consumerTag,
-    clientName,
-    authorization,
-  } = options;
+  const { services, request, consumerTag, clientName } = options;
 
   const resolved = services.capabilityResolver.resolveToolCall(
     request.params.name,
@@ -555,7 +811,28 @@ async function executeToolCall(options: {
   if (!resolved.ok) {
     throw makeUnavailableError("Tool", request.params.name, resolved.reason);
   }
-  const { entry } = resolved;
+  return executeResolvedToolCall({ ...options, entry: resolved.entry });
+}
+
+// Dispatch for an entry the caller has just resolved and authorized.
+function executeResolvedToolCall(options: {
+  services: Services;
+  sessionId: string | undefined;
+  request: CallToolRequest;
+  entry: ActiveTool;
+  clientName: string | undefined;
+  consumerTag: string | undefined;
+  authorization: string | undefined;
+}): Promise<ToolCallResultUnion> {
+  const {
+    services,
+    sessionId,
+    request,
+    entry,
+    consumerTag,
+    clientName,
+    authorization,
+  } = options;
 
   return services.systemStateTracker.trackActiveCall(() => {
     if (entry.origin === "internal") {
