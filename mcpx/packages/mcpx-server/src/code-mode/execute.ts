@@ -4,6 +4,7 @@ import z from "zod/v4";
 import { ToolCallResultUnion } from "../model/sessions.js";
 import { ApprovalRequester } from "./approval.js";
 import {
+  classifyReadOnlyCall,
   classifyToolCall,
   CodeModeLimits,
   CodeModeTrustPolicy,
@@ -12,6 +13,7 @@ import {
   runSandbox,
   SandboxLog,
   SandboxOutcome,
+  SandboxReply,
   SandboxRequest,
 } from "./sandbox.js";
 import { CODE_MODE_RESERVED_TOOL_NAMES } from "./tool.js";
@@ -87,8 +89,23 @@ interface CallReport {
   approval?: "trusted_read" | "user_approved";
   errorCode?: string;
   outcome?: "unknown";
+  // UTF-8 bytes of the result MCPX received, present only when one arrived
+  resultBytes?: number;
   resultWithheld?: boolean;
   durationMs?: number;
+}
+
+/*
+ * UTF-8 byte counts at two boundaries. `received` is a reply MCPX got from a
+ * tool or from discovery, measured on the JSON it builds for the script;
+ * `sent` is the part that MCPX actually sent to the runner process, so a
+ * withheld oversized reply, or one ready only after the script stopped,
+ * counts as received only. Neither includes the broker envelope, the
+ * guest-side `text` and `data` copies, or refusals and error replies.
+ */
+interface ByteCounts {
+  received: number;
+  sent: number;
 }
 
 interface ExecuteCodeProps {
@@ -96,6 +113,8 @@ interface ExecuteCodeProps {
   runnerPath: string;
   limits: CodeModeLimits;
   trust: CodeModeTrustPolicy;
+  // only trusted reads run; set for mcpx_execute_readonly
+  readOnly?: boolean;
   gateway: CodeModeGateway;
   approve?: ApprovalRequester;
   signal?: AbortSignal;
@@ -110,6 +129,9 @@ const callPayloadSchema = z
   })
   .strict();
 
+// a reply is `{"ok":true,"value":<value JSON>}`; sizes exclude this wrapper
+const REPLY_ENVELOPE_BYTES = Buffer.byteLength('{"ok":true,"value":}');
+
 const FAILURE_NOTE =
   "Some tool calls started before the script stopped. MCPX never retries calls or scripts automatically; check each call's status before retrying anything.";
 
@@ -118,6 +140,7 @@ export async function executeCode(
 ): Promise<CallToolResult> {
   const { code, runnerPath, limits, trust, gateway, approve, signal, logger } =
     props;
+  const readOnly = props.readOnly === true;
   const startedAt = Date.now();
   const deadline = startedAt + limits.wallMs;
   const calls: CallReport[] = [];
@@ -128,11 +151,23 @@ export async function executeCode(
   let callsOverLimit = 0;
   let discoveryRequests = 0;
   let pendingRequests = 0;
+  const toolBytes: ByteCounts = { received: 0, sent: 0 };
+  const discoveryBytes: ByteCounts = { received: 0, sent: 0 };
+  const counted = (
+    counts: ByteCounts,
+    valueText: string,
+    valueBytes: number,
+  ): SandboxReply => ({
+    payload: okReply(valueText),
+    onSent: (): void => {
+      counts.sent += valueBytes;
+    },
+  });
 
   const handleCall = async (
     payload: unknown,
     stopped: AbortSignal,
-  ): Promise<string> => {
+  ): Promise<SandboxReply> => {
     const parsed = callPayloadSchema.safeParse(payload);
     if (!parsed.success) {
       return failure(
@@ -172,14 +207,31 @@ export async function executeCode(
         report.errorCode = resolved.code;
         return failure(resolved.code, resolved.message);
       }
-      const classification = classifyToolCall({
+      const target = {
         name,
         serverName: resolved.serverName,
         origin: resolved.origin,
         definition: resolved.definition,
         trust,
-      });
-      if (approve && classification.kind === "approval-required") {
+      };
+      if (readOnly) {
+        const decision = classifyReadOnlyCall(target);
+        if (decision.kind === "blocked") {
+          report.status = "rejected";
+          report.errorCode = "read_only_blocked";
+          return failure(
+            "read_only_blocked",
+            decision.reason === "declares-write"
+              ? `${name} declares that it can change state, so mcpx_execute_readonly does not run it`
+              : `${name} is not a read that this gateway trusts, so mcpx_execute_readonly does not run it`,
+          );
+        }
+        // read-only mode never asks; it runs trusted reads only
+        report.approval = "trusted_read";
+      } else if (
+        approve &&
+        classifyToolCall(target).kind === "approval-required"
+      ) {
         report.status = "awaiting_approval";
         const releaseApproval = await approvals.acquire(stopped);
         if (!releaseApproval) return failure("cancelled", "The script stopped");
@@ -249,8 +301,11 @@ export async function executeCode(
       }
       const value = projectResult(outcome.result);
       report.status = value.isError ? "tool_error" : "succeeded";
-      const text = JSON.stringify({ ok: true, value });
-      if (Buffer.byteLength(text) > limits.maxToolResultBytes) {
+      const valueText = JSON.stringify(value);
+      const valueBytes = Buffer.byteLength(valueText);
+      report.resultBytes = valueBytes;
+      toolBytes.received += valueBytes;
+      if (valueBytes + REPLY_ENVELOPE_BYTES > limits.maxToolResultBytes) {
         report.resultWithheld = true;
         return failure(
           "result_too_large",
@@ -258,7 +313,7 @@ export async function executeCode(
           { outcome: "completed" },
         );
       }
-      return text;
+      return counted(toolBytes, valueText, valueBytes);
     } finally {
       release();
     }
@@ -268,7 +323,7 @@ export async function executeCode(
     tool: DiscoveryTool,
     args: Record<string, unknown>,
     stopped: AbortSignal,
-  ): Promise<string> => {
+  ): Promise<SandboxReply> => {
     if (discoveryRequests >= limits.maxDiscoveryRequests) {
       return failure(
         "discovery_limit",
@@ -280,14 +335,17 @@ export async function executeCode(
     if (!release) return failure("cancelled", "The script stopped");
     try {
       if (stopped.aborted) return failure("cancelled", "The script stopped");
-      const text = await discover(gateway, tool, args);
-      if (Buffer.byteLength(text) > limits.maxToolResultBytes) {
+      const reply = await discover(gateway, tool, args);
+      if (!reply.ok) return reply.failure;
+      const valueBytes = Buffer.byteLength(reply.valueText);
+      discoveryBytes.received += valueBytes;
+      if (valueBytes + REPLY_ENVELOPE_BYTES > limits.maxToolResultBytes) {
         return failure(
           "result_too_large",
           `The discovery result exceeds ${limits.maxToolResultBytes} bytes`,
         );
       }
-      return text;
+      return counted(discoveryBytes, reply.valueText, valueBytes);
     } finally {
       release();
     }
@@ -296,7 +354,7 @@ export async function executeCode(
   const onRequest = async (
     request: SandboxRequest,
     stopped: AbortSignal,
-  ): Promise<string> => {
+  ): Promise<SandboxReply> => {
     if (stopped.aborted) return failure("cancelled", "The script stopped");
     if (pendingRequests >= limits.maxPendingRequests) {
       return failure(
@@ -337,6 +395,7 @@ export async function executeCode(
 
   logger.info("Code Mode execution started", {
     executionId: props.executionId,
+    readOnly,
     codeBytes: Buffer.byteLength(code),
   });
   const outcome = await runSandbox({
@@ -348,35 +407,48 @@ export async function executeCode(
     onLog: (log) => logs.push(log),
   });
 
+  // snapshot now: a call still in flight must not add to the report later;
+  // nothing is sent to the runner after it stopped
   const finalCalls = calls.map(finalizeReport);
   const ok = outcome.status === "completed";
+  const logLines = logs.map(({ level, text }) =>
+    level === "log" ? text : `[${level}] ${text}`,
+  );
+  const bytes = {
+    toolResults: { ...toolBytes },
+    discovery: { ...discoveryBytes },
+    // the returned value's JSON; absent when the script failed
+    ...(outcome.status === "completed"
+      ? { result: Buffer.byteLength(outcome.result) }
+      : {}),
+    logs: logLines.reduce((sum, line) => sum + Buffer.byteLength(line), 0),
+  };
   const output = {
     ok,
+    ...(readOnly ? { readOnly: true } : {}),
     ...(outcome.status === "completed"
       ? { result: JSON.parse(outcome.result) as unknown }
       : { error: describeOutcome(outcome, limits) }),
     calls: finalCalls,
     ...(callsOverLimit > 0 ? { callsOverLimit } : {}),
-    ...(logs.length > 0
-      ? {
-          logs: logs.map(({ level, text }) =>
-            level === "log" ? text : `[${level}] ${text}`,
-          ),
-        }
-      : {}),
+    ...(logLines.length > 0 ? { logs: logLines } : {}),
     ...(!ok && finalCalls.some((call) => wasStarted(call.status))
       ? { note: FAILURE_NOTE }
       : {}),
+    bytes,
     wallMs: Date.now() - startedAt,
   };
   logger.info("Code Mode execution finished", {
     executionId: props.executionId,
+    readOnly,
     status: outcome.status,
-    calls: finalCalls.map(({ tool, status, approval }) => ({
+    calls: finalCalls.map(({ tool, status, approval, errorCode }) => ({
       tool,
       status,
       approval,
+      errorCode,
     })),
+    bytes,
   });
   return {
     content: [{ type: "text", text: JSON.stringify(output) }],
@@ -467,17 +539,24 @@ function projectResult(result: ToolCallResultUnion): {
   };
 }
 
+// the discovery text is the same JSON a direct discovery call returns
 async function discover(
   gateway: CodeModeGateway,
   tool: DiscoveryTool,
   args: Record<string, unknown>,
-): Promise<string> {
+): Promise<{ ok: true; valueText: string } | { ok: false; failure: string }> {
   const result = await gateway.discover(tool, args);
-  if (isRejection(result)) return failure(result.code, result.message);
+  if (isRejection(result)) {
+    return { ok: false, failure: failure(result.code, result.message) };
+  }
   const first = result.content[0];
   const text = first?.type === "text" ? first.text : "";
-  if (result.isError) return failure("invalid_request", text);
-  return JSON.stringify({ ok: true, value: JSON.parse(text) as unknown });
+  if (result.isError) {
+    return { ok: false, failure: failure("invalid_request", text) };
+  }
+  // reject a reply that is not one JSON value before it is spliced into the envelope
+  JSON.parse(text);
+  return { ok: true, valueText: text };
 }
 
 function isRejection(
@@ -490,6 +569,10 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+function okReply(valueText: string): string {
+  return `{"ok":true,"value":${valueText}}`;
 }
 
 function failure(

@@ -1,6 +1,6 @@
 ---
 name: use-lunar-mcpx
-description: Use an existing Lunar MCPX connection to discover upstream services and tools, inspect their schemas, execute authorized calls, chain and filter calls server-side with mcpx_execute, and diagnose connection or sign-in problems through advertised management tools. For gateway usage, not source development, Docker deployment, upgrades, or credential migration.
+description: Use an existing Lunar MCPX connection to discover upstream services and tools, inspect their schemas, execute authorized calls, chain and filter calls server-side with mcpx_execute or mcpx_execute_readonly, and diagnose connection or sign-in problems through advertised management tools. For gateway usage, not source development, Docker deployment, upgrades, or credential migration.
 ---
 
 # Use Lunar MCPX
@@ -30,9 +30,12 @@ When `mcpx_execute` is advertised, use it for multi-step work whose intermediate
 results are large or only needed to choose the next call: list, filter, join or
 summarize inside MCPX and return only the final value. Its `code` is an async
 function body that calls `mcpx.searchTools`, `mcpx.getToolSchema` and
-`mcpx.callTool`. Read [Code Mode](references/code-mode.md) for the script API,
-result report, approval prompts and limits. Use ordinary calls for a single
-simple operation.
+`mcpx.callTool`; `mcpx.describe` shows a result's shape without its values.
+When `mcpx_execute_readonly` is advertised, prefer it for read-only work: it
+runs only inner calls that the gateway trusts as reads. Read
+[Code Mode](references/code-mode.md) for the script API, result report, byte
+counts, approval prompts, read-only refusals and limits. Use ordinary calls for
+a single simple operation.
 
 If an upstream service exposes its own discovery mechanism, use its returned
 instructions and schemas to discover the specific operation before executing it.

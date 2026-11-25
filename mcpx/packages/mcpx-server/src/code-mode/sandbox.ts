@@ -23,6 +23,12 @@ export interface SandboxRequest {
   payload: string;
 }
 
+/*
+ * Reply JSON for one script request. `onSent` runs only if the reply was
+ * actually sent to the runner, which is not the case once the script stopped.
+ */
+export type SandboxReply = string | { payload: string; onSent: () => void };
+
 export interface SandboxLog {
   level: string;
   text: string;
@@ -51,7 +57,10 @@ export interface RunSandboxProps {
    * script can no longer receive the answer, so callers must not start new
    * work after it fires.
    */
-  onRequest: (request: SandboxRequest, stopped: AbortSignal) => Promise<string>;
+  onRequest: (
+    request: SandboxRequest,
+    stopped: AbortSignal,
+  ) => Promise<SandboxReply>;
   onLog: (log: SandboxLog) => void;
 }
 
@@ -202,9 +211,10 @@ export function runSandbox(props: RunSandboxProps): Promise<SandboxOutcome> {
       });
     });
 
-    const reply = (id: number, payload: string): void => {
-      if (settled || !runner.connected) return;
+    const reply = (id: number, payload: string): boolean => {
+      if (settled || !runner.connected) return false;
       runner.send({ type: "reply", id, payload });
+      return true;
     };
 
     runner.on("message", (raw: unknown) => {
@@ -258,7 +268,10 @@ export function runSandbox(props: RunSandboxProps): Promise<SandboxOutcome> {
             { op: message.op, payload: message.payload },
             stopped.signal,
           )
-            .then((payload) => reply(id, payload))
+            .then((answer) => {
+              if (typeof answer === "string") reply(id, answer);
+              else if (reply(id, answer.payload)) answer.onSent();
+            })
             .catch((error: unknown) =>
               reply(
                 id,

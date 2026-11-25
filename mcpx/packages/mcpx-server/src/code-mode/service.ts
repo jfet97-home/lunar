@@ -10,7 +10,7 @@ import {
   CodeModeTrustPolicy,
   DEFAULT_CODE_MODE_LIMITS,
 } from "./policy.js";
-import { buildCodeModeTool } from "./tool.js";
+import { buildCodeModeReadOnlyTool, buildCodeModeTool } from "./tool.js";
 import { Tool } from "@modelcontextprotocol/sdk/types.js";
 import z from "zod/v4";
 
@@ -77,7 +77,8 @@ const executeArgsSchema = (
 
 export class CodeModeService {
   readonly available: boolean;
-  readonly tool: Tool;
+  // mcpx_execute, then mcpx_execute_readonly
+  readonly tools: Tool[];
   private active = 0;
   private readonly logger: Logger;
 
@@ -86,7 +87,10 @@ export class CodeModeService {
     logger: Logger,
   ) {
     this.logger = logger.child({ component: "CodeMode" });
-    this.tool = buildCodeModeTool(config.limits, config.requireToolApproval);
+    this.tools = [
+      buildCodeModeTool(config.limits, config.requireToolApproval),
+      buildCodeModeReadOnlyTool(config.limits),
+    ];
     this.available =
       config.enabled &&
       config.runnerPath !== undefined &&
@@ -100,6 +104,8 @@ export class CodeModeService {
 
   async execute(props: {
     args: Record<string, unknown>;
+    // mcpx_execute_readonly: only trusted reads run, and nothing asks for approval
+    readOnly?: boolean;
     gateway: CodeModeGateway;
     approve: ApprovalRequester;
     signal?: AbortSignal;
@@ -128,8 +134,12 @@ export class CodeModeService {
         runnerPath,
         limits: this.config.limits,
         trust: this.config.trust,
+        readOnly: props.readOnly === true,
         gateway: props.gateway,
-        approve: this.config.requireToolApproval ? props.approve : undefined,
+        approve:
+          this.config.requireToolApproval && props.readOnly !== true
+            ? props.approve
+            : undefined,
         signal: props.signal,
         logger: this.logger,
         executionId: randomUUID(),

@@ -44,8 +44,8 @@ Once MCPX is running, point your client at one of these endpoints:
 
 | Endpoint | How the client sees tools |
 | --- | --- |
-| `http://localhost:9000/mcp/lazy` | Four discovery tools, `mcpx_execute`, and permitted built-in management tools. Upstream tools are discovered when needed. |
-| `http://localhost:9000/mcp` | The complete catalog of upstream tools visible to that client, plus `mcpx_execute`. |
+| `http://localhost:9000/mcp/lazy` | Four discovery tools, `mcpx_execute`, `mcpx_execute_readonly`, and permitted built-in management tools. Upstream tools are discovered when needed. |
+| `http://localhost:9000/mcp` | The complete catalog of upstream tools visible to that client, plus `mcpx_execute` and `mcpx_execute_readonly`. |
 
 The examples below use the on-demand endpoint. Replace `localhost:9000` with your gateway address when running it elsewhere.
 
@@ -99,9 +99,12 @@ Both endpoints also advertise `mcpx_execute`. It runs a short JavaScript program
 in an isolated sandbox inside MCPX, so a client can discover tools, call them,
 and filter large intermediate results without passing each result through the
 model. The client controls approval of `mcpx_execute`. Each inner call keeps
-the caller's gateway permissions and audit.
+the caller's gateway permissions and audit, and the result reports the bytes
+that each call returned. `mcpx_execute_readonly` runs the same kind of script
+but refuses every inner call that the gateway does not trust as a read, so a
+client can approve it separately.
 See the [Code Mode guide](mcpx/docs/code-mode.md) for the script interface,
-approval policy, isolation, and limits.
+approval and read-only policy, isolation, and limits.
 
 ## Manage MCP servers from an MCP client
 
@@ -225,7 +228,7 @@ Changes to MCPX, the shared core, or the publishing workflow on `main` run regre
 | [Lunar Proxy](proxy/README.md) | Outbound API traffic visibility and policies, including rate limits, retries, queues, and circuit breakers. |
 | [Shared core](ai-gateway-shared/public/README.md) | Shared infrastructure used by the gateway components. |
 | [Tool discovery guide](mcpx/docs/lazy-tools.md) | The four gateway tools, search behavior, and client configuration. |
-| [Code Mode guide](mcpx/docs/code-mode.md) | Server-side scripts with `mcpx_execute`, approvals, isolation, and limits. |
+| [Code Mode guide](mcpx/docs/code-mode.md) | Server-side scripts with `mcpx_execute` and `mcpx_execute_readonly`, approvals, isolation, and limits. |
 | [Management tools guide](mcpx/docs/management-tools.md) | Built-in server administration, permissions, OAuth, and backup behavior. |
 | [Backup and restore guide](mcpx/docs/local-saved-setups-and-export.md) | Saved setup behavior, export coverage, Docker mounts, and manual recovery. |
 
