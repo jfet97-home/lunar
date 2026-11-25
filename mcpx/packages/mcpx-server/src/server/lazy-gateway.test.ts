@@ -1067,7 +1067,7 @@ describe("lazy Streamable HTTP gateway", () => {
         format: "compact",
         description: "Create a Jira issue",
         annotations: { destructiveHint: false },
-        required: ["id"],
+        required: issue.definition.inputSchema.required,
         inputType:
           '{ /** Project key */ project: string; type: "Bug" | "Task"; fields?: { labels?: string[]; [key: string]: unknown } }',
         complete: false,
