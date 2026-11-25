@@ -13,6 +13,7 @@ export interface SandboxLimits {
   stackBytes: number;
   runnerHeapMb: number;
   maxRequestBytes: number;
+  maxPendingRequests: number;
   maxLogBytes: number;
   maxResultBytes: number;
 }
@@ -224,6 +225,7 @@ export function runSandbox(props: RunSandboxProps): Promise<SandboxOutcome> {
               memoryBytes: limits.memoryBytes,
               stackBytes: limits.stackBytes,
               maxRequestBytes: limits.maxRequestBytes,
+              maxPendingRequests: limits.maxPendingRequests,
               maxLogBytes: limits.maxLogBytes,
               maxResultBytes: limits.maxResultBytes,
             },
@@ -231,7 +233,7 @@ export function runSandbox(props: RunSandboxProps): Promise<SandboxOutcome> {
           return;
         case "log": {
           const remaining = limits.maxLogBytes - logBytes;
-          if (remaining <= 0) return;
+          if (remaining <= 0 || message.text.length === 0) return;
           const text = message.text.slice(0, remaining);
           logBytes += Buffer.byteLength(text);
           onLog({ level: message.level, text });

@@ -25,6 +25,7 @@ interface RunnerLimits {
   memoryBytes: number;
   stackBytes: number;
   maxRequestBytes: number;
+  maxPendingRequests: number;
   maxLogBytes: number;
   maxResultBytes: number;
 }
@@ -223,29 +224,37 @@ async function run(start: StartMessage): Promise<void> {
     return detail;
   };
 
+  const rejectRequest = (code: string, message: string): QuickJSHandle => {
+    const deferred = context.newPromise();
+    const error = context.newString(
+      JSON.stringify({ ok: false, error: { code, message } }),
+    );
+    deferred.resolve(error);
+    error.dispose();
+    return deferred.handle;
+  };
+
   const hostFn = context.newFunction(
     "__mcpxHost",
     (opHandle, payloadHandle) => {
       const op = context.getString(opHandle);
-      const payload = context.getString(payloadHandle);
       if (!HOST_OPS.has(op)) {
         return context.newError(`Unknown host operation: ${op}`);
       }
-      const deferred = context.newPromise();
-      if (Buffer.byteLength(payload) > limits.maxRequestBytes) {
-        const error = context.newString(
-          JSON.stringify({
-            ok: false,
-            error: {
-              code: "request_too_large",
-              message: `Request exceeds ${limits.maxRequestBytes} bytes`,
-            },
-          }),
+      if (pending.size >= limits.maxPendingRequests) {
+        return rejectRequest(
+          "too_many_pending_requests",
+          `The script has ${limits.maxPendingRequests} unanswered requests; await some before sending more`,
         );
-        deferred.resolve(error);
-        error.dispose();
-        return deferred.handle;
       }
+      const payload = context.getString(payloadHandle);
+      if (Buffer.byteLength(payload) > limits.maxRequestBytes) {
+        return rejectRequest(
+          "request_too_large",
+          `Request exceeds ${limits.maxRequestBytes} bytes`,
+        );
+      }
+      const deferred = context.newPromise();
       const id = nextRequestId++;
       pending.set(id, deferred);
       send({ type: "request", id, op, payload });
@@ -261,6 +270,7 @@ async function run(start: StartMessage): Promise<void> {
     const text = context.getString(textHandle);
     const remaining = limits.maxLogBytes - logBytes;
     const bytes = Buffer.byteLength(text);
+    if (bytes === 0) return;
     if (bytes > remaining) {
       logTruncated = true;
       send({

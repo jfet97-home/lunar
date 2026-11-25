@@ -21,6 +21,7 @@ const LIMITS: SandboxLimits = {
   stackBytes: 256 * 1024,
   runnerHeapMb: 64,
   maxRequestBytes: 64 * 1024,
+  maxPendingRequests: 64,
   maxLogBytes: 1024,
   maxResultBytes: 64 * 1024,
 };
@@ -184,6 +185,31 @@ describe("Code Mode sandbox runner", () => {
       0,
     );
     expect(total).toBeLessThanOrEqual(LIMITS.maxLogBytes);
+  });
+
+  it("does not send empty console messages through the broker", async () => {
+    const { outcome, logs } = await run(`
+      for (let i = 0; i < 1000; i++) console.log();
+      console.log("finished");
+      return 1;
+    `);
+    expect(outcome.status).toBe("completed");
+    expect(logs).toEqual([{ level: "log", text: "finished" }]);
+  });
+
+  it("limits outstanding requests before they enter the broker", async () => {
+    const onRequest = jest.fn(async () => '{"ok":true,"value":1}');
+    const { outcome } = await run(
+      `return await Promise.all(Array.from({ length: 4 }, () =>
+        mcpx.listServers().catch((error) => error.code),
+      ));`,
+      { limits: { maxPendingRequests: 2 }, onRequest },
+    );
+    expect(onRequest).toHaveBeenCalledTimes(2);
+    expect(outcome).toEqual({
+      status: "completed",
+      result: '[1,1,"too_many_pending_requests","too_many_pending_requests"]',
+    });
   });
 
   it("kills the runner at the wall-time limit and stops brokering", async () => {
