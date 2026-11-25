@@ -53,8 +53,8 @@ For standalone saved setups and local full exports, see
 [Local saved setups and full exports](./docs/local-saved-setups-and-export.md).
 For reconnection behavior after an upstream outage, see
 [Upstream connection recovery](./docs/upstream-recovery.md).
-To chain and filter tool calls inside the gateway with `mcpx_execute`, see
-[Code Mode](./docs/code-mode.md).
+To chain and filter tool calls inside the gateway with `mcpx_execute`, or with
+`mcpx_execute_readonly` for trusted reads only, see [Code Mode](./docs/code-mode.md).
 
 
 ## Connecting to MCPX

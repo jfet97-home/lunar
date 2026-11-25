@@ -63,6 +63,7 @@ import {
 import {
   CATALOG_INSTRUCTIONS,
   CODE_MODE_INSTRUCTIONS,
+  CODE_MODE_READONLY_TOOL_NAME,
   CODE_MODE_TOOL_NAME,
 } from "../code-mode/tool.js";
 const toolSearches = new WeakMap<Services, LocalToolSearch>();
@@ -123,7 +124,7 @@ export async function getServer(
 
       const permittedTools =
         services.capabilityResolver.getPermittedTools(consumer);
-      const codeModeTools = codeMode.available ? [codeMode.tool] : [];
+      const codeModeTools = codeMode.available ? codeMode.tools : [];
       if (toolMode === "lazy") {
         const managementTools = listLazyManagementTools(
           permittedTools,
@@ -300,7 +301,12 @@ export async function getServer(
   server.setRequestHandler(
     CallToolRequestSchema,
     async (request, { sessionId, sendNotification, sendRequest, signal }) => {
-      if (codeMode.available && request.params.name === CODE_MODE_TOOL_NAME) {
+      const codeModeName = request.params.name;
+      if (
+        codeMode.available &&
+        (codeModeName === CODE_MODE_TOOL_NAME ||
+          codeModeName === CODE_MODE_READONLY_TOOL_NAME)
+      ) {
         const keepaliveStopper = setupDownstreamKeepalive({
           request,
           supportsKeepalive: supportsDownstreamKeepalive(services, sessionId),
@@ -313,6 +319,7 @@ export async function getServer(
         try {
           return await codeMode.execute({
             args: request.params.arguments ?? {},
+            readOnly: codeModeName === CODE_MODE_READONLY_TOOL_NAME,
             gateway: buildCodeModeGateway({ services, sessionId, logger }),
             approve: createElicitationApprover({
               supported: () =>

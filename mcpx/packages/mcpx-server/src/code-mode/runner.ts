@@ -112,7 +112,112 @@ const PRELUDE = `
     }
     return { ...result, text, data };
   };
+  /*
+   * A bounded shape description that never includes values. Leaves are type
+   * names; arrays sample their first elements. Properties are read through
+   * their own descriptors, so getters never run. The budgets cap the values
+   * inspected and the output; listing one object's own keys is a single
+   * engine step that counts against the script's CPU and memory budget.
+   */
+  const SHAPE = { depth: 6, keys: 24, items: 3, nodes: 200, keyChars: 64 };
+  const own = (target, key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+    if (descriptor === undefined) return { value: undefined };
+    return "value" in descriptor ? { value: descriptor.value } : { accessor: true };
+  };
+  const describe = (root) => {
+    let nodes = 0;
+    const ancestors = [];
+    const entry = (target, key, depth) => {
+      let read;
+      try {
+        read = own(target, key);
+      } catch {
+        return "unreadable";
+      }
+      return read.accessor ? "accessor" : shapeOf(read.value, depth);
+    };
+    const within = (value, walk) => {
+      ancestors.push(value);
+      try {
+        return walk();
+      } finally {
+        ancestors.pop();
+      }
+    };
+    const describeArray = (value, depth) => {
+      // the own length property, so no getter or proxy get trap runs
+      const length = own(value, "length").value;
+      if (!Number.isSafeInteger(length) || length < 0) return "unreadable";
+      const node = { type: "array", length };
+      if (length === 0) return { ...node, items: [] };
+      if (depth >= SHAPE.depth) return { ...node, depthLimited: true };
+      const items = [];
+      const seen = new Set();
+      let sampled = 0;
+      const wanted = Math.min(length, SHAPE.items);
+      within(value, () => {
+        while (sampled < wanted && nodes < SHAPE.nodes) {
+          const shape = entry(value, String(sampled), depth + 1);
+          sampled += 1;
+          const key = JSON.stringify(shape);
+          if (!seen.has(key)) {
+            seen.add(key);
+            items.push(shape);
+          }
+        }
+      });
+      node.items = items;
+      if (sampled < length) node.sampled = sampled;
+      return node;
+    };
+    const describeObject = (value, depth) => {
+      const node = { type: "object" };
+      if (depth >= SHAPE.depth) return { ...node, depthLimited: true };
+      const names = Object.keys(value);
+      const keys = {};
+      let examined = 0;
+      let listed = 0;
+      within(value, () => {
+        for (const name of names) {
+          if (examined >= SHAPE.keys || nodes >= SHAPE.nodes) break;
+          examined += 1;
+          const label =
+            name.length > SHAPE.keyChars ? name.slice(0, SHAPE.keyChars) + "..." : name;
+          // a cut name that repeats a listed label still uses the key budget
+          if (Object.prototype.hasOwnProperty.call(keys, label)) continue;
+          // defineProperty keeps keys such as __proto__ as plain entries
+          Object.defineProperty(keys, label, {
+            value: entry(value, name, depth + 1),
+            enumerable: true,
+            writable: true,
+            configurable: true,
+          });
+          listed += 1;
+        }
+      });
+      node.keys = keys;
+      if (listed < names.length) node.moreKeys = names.length - listed;
+      return node;
+    };
+    const shapeOf = (value, depth) => {
+      nodes += 1;
+      if (value === null) return "null";
+      if (typeof value !== "object") return typeof value;
+      if (ancestors.includes(value)) return "circular";
+      try {
+        return Array.isArray(value)
+          ? describeArray(value, depth)
+          : describeObject(value, depth);
+      } catch {
+        // a revoked proxy or a throwing proxy trap
+        return "unreadable";
+      }
+    };
+    return shapeOf(root, 0);
+  };
   globalThis.mcpx = Object.freeze({
+    describe,
     callTool: async (name, args) =>
       withConveniences(
         await request("call", { name, arguments: args === undefined ? {} : args }),
@@ -276,7 +381,10 @@ async function run(start: StartMessage): Promise<void> {
       send({
         type: "log",
         level,
-        text: Buffer.from(text).subarray(0, Math.max(remaining, 0)).toString(),
+        text: new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+          Buffer.from(text).subarray(0, Math.max(remaining, 0)),
+          { stream: true },
+        ),
         truncated: true,
       });
       logBytes = limits.maxLogBytes;

@@ -96,6 +96,42 @@ export function classifyToolCall(props: {
   return { kind: "approval-required" };
 }
 
+export type ReadOnlyDecision =
+  | Extract<CallClassification, { kind: "trusted-read" }>
+  | { kind: "blocked"; reason: "declares-write" | "not-trusted" };
+
+/*
+ * mcpx_execute_readonly runs a call only when the trust policy above, limited
+ * to exact entries, classifies it as a trusted read. A `*` pattern also
+ * matches tools and servers added later, so it does not count here.
+ * Annotations can only narrow the result: a definition that declares a write
+ * (readOnlyHint false or destructiveHint true) is refused even when its exact
+ * name is listed.
+ */
+export function classifyReadOnlyCall(
+  props: Parameters<typeof classifyToolCall>[0],
+): ReadOnlyDecision {
+  const annotations = props.definition.annotations;
+  if (
+    annotations?.readOnlyHint === false ||
+    annotations?.destructiveHint === true
+  ) {
+    return { kind: "blocked", reason: "declares-write" };
+  }
+  const exact = (patterns: string[]): string[] =>
+    patterns.filter((pattern) => !pattern.includes("*"));
+  const classification = classifyToolCall({
+    ...props,
+    trust: {
+      trustedReadTools: exact(props.trust.trustedReadTools),
+      trustedAnnotationServers: exact(props.trust.trustedAnnotationServers),
+    },
+  });
+  return classification.kind === "trusted-read"
+    ? classification
+    : { kind: "blocked", reason: "not-trusted" };
+}
+
 // Anchored match where `*` is the only wildcard; every other character is literal.
 export function matchesPattern(pattern: string, value: string): boolean {
   const source = pattern

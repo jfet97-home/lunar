@@ -23,9 +23,19 @@ export interface SandboxRequest {
   payload: string;
 }
 
+/*
+ * Reply JSON for one script request. `onSent` runs only if the reply was
+ * actually sent to the runner, which is not the case once the script stopped.
+ */
+export type SandboxReply = string | { payload: string; onSent: () => void };
+
 export interface SandboxLog {
   level: string;
   text: string;
+}
+
+export function formatSandboxLog({ level, text }: SandboxLog): string {
+  return level === "log" ? text : `[${level}] ${text}`;
 }
 
 export interface SandboxError {
@@ -51,7 +61,10 @@ export interface RunSandboxProps {
    * script can no longer receive the answer, so callers must not start new
    * work after it fires.
    */
-  onRequest: (request: SandboxRequest, stopped: AbortSignal) => Promise<string>;
+  onRequest: (
+    request: SandboxRequest,
+    stopped: AbortSignal,
+  ) => Promise<SandboxReply>;
   onLog: (log: SandboxLog) => void;
 }
 
@@ -202,9 +215,10 @@ export function runSandbox(props: RunSandboxProps): Promise<SandboxOutcome> {
       });
     });
 
-    const reply = (id: number, payload: string): void => {
-      if (settled || !runner.connected) return;
+    const reply = (id: number, payload: string): boolean => {
+      if (settled || !runner.connected) return false;
       runner.send({ type: "reply", id, payload });
+      return true;
     };
 
     runner.on("message", (raw: unknown) => {
@@ -232,10 +246,20 @@ export function runSandbox(props: RunSandboxProps): Promise<SandboxOutcome> {
           });
           return;
         case "log": {
-          const remaining = limits.maxLogBytes - logBytes;
+          const prefixBytes = Buffer.byteLength(
+            formatSandboxLog({ level: message.level, text: "" }),
+          );
+          const remaining = limits.maxLogBytes - logBytes - prefixBytes;
           if (remaining <= 0 || message.text.length === 0) return;
-          const text = message.text.slice(0, remaining);
-          logBytes += Buffer.byteLength(text);
+          const text =
+            Buffer.byteLength(message.text) <= remaining
+              ? message.text
+              : new TextDecoder("utf-8", { ignoreBOM: true }).decode(
+                  Buffer.from(message.text).subarray(0, remaining),
+                  { stream: true },
+                );
+          if (text.length === 0) return;
+          logBytes += prefixBytes + Buffer.byteLength(text);
           onLog({ level: message.level, text });
           return;
         }
@@ -258,7 +282,10 @@ export function runSandbox(props: RunSandboxProps): Promise<SandboxOutcome> {
             { op: message.op, payload: message.payload },
             stopped.signal,
           )
-            .then((payload) => reply(id, payload))
+            .then((answer) => {
+              if (typeof answer === "string") reply(id, answer);
+              else if (reply(id, answer.payload)) answer.onSent();
+            })
             .catch((error: unknown) =>
               reply(
                 id,

@@ -8,8 +8,9 @@ permissions, and sessions. The existing `/mcp` and `/sse` endpoints remain
 available for clients that need the complete catalog.
 
 When Code Mode is enabled, both endpoints also advertise `mcpx_execute`, which
-runs a script that chains these operations server-side. See the
-[Code Mode guide](code-mode.md).
+runs a script that chains these operations server-side, and
+`mcpx_execute_readonly`, which runs only inner calls that the gateway trusts as
+reads. See the [Code Mode guide](code-mode.md).
 
 ## Discovery and execution
 

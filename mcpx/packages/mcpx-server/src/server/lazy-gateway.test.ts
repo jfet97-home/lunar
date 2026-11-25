@@ -1269,7 +1269,13 @@ describe("Code Mode on the gateway endpoints", () => {
         runnerPath,
         limits: { ...DEFAULT_CODE_MODE_LIMITS, wallMs: 15_000 },
         trust: {
-          trustedReadTools: ["docs__*", "newsrv__*"],
+          // read-only mode counts only the exact names
+          trustedReadTools: [
+            "docs__*",
+            "newsrv__*",
+            ALLOWED_NAME,
+            "newsrv__lookup",
+          ],
           trustedAnnotationServers: [],
         },
       },
@@ -1333,9 +1339,21 @@ describe("Code Mode on the gateway endpoints", () => {
         "mcpx_get_tool_schema",
         "mcpx_call_tool",
         "mcpx_execute",
+        "mcpx_execute_readonly",
       ]);
-      expect(catalog.client.getInstructions()).toContain("mcpx_execute");
-      expect(lazy.client.getInstructions()).toContain("mcpx_execute");
+      expect(catalogNames).toContain("mcpx_execute_readonly");
+      for (const { client } of [catalog, lazy]) {
+        expect(client.getInstructions()).toContain("mcpx_execute");
+        expect(client.getInstructions()).toContain("mcpx_execute_readonly");
+        const readOnlyTool = (await client.listTools()).tools.find(
+          (tool) => tool.name === "mcpx_execute_readonly",
+        );
+        expect(readOnlyTool?.annotations).toMatchObject({
+          readOnlyHint: true,
+          destructiveHint: false,
+        });
+        expect(readOnlyTool?.description).toContain("read_only_blocked");
+      }
       expect(lazy.client.getInstructions()).toContain("mcpx_list_servers");
 
       await catalog.client.callTool({
@@ -1622,6 +1640,279 @@ describe("Code Mode on the gateway endpoints", () => {
       }
     },
   );
+
+  function readOnlyEntries(): ToolEntry[] {
+    const annotated = (
+      serverName: string,
+      capabilityName: string,
+      annotations: Tool["annotations"],
+      origin: ToolEntry["origin"] = "upstream",
+    ): ToolEntry => {
+      const entry = makeEntry(
+        serverName,
+        capabilityName,
+        `${serverName}__${capabilityName}`,
+        origin,
+      );
+      return { ...entry, definition: { ...entry.definition, annotations } };
+    };
+    return [
+      ...entries(),
+      // an operator pattern lists it, but it declares a write
+      annotated("docs", "delete_page", { destructiveHint: true }),
+      // an upstream hint on a server the operator does not trust
+      annotated("wiki", "read", { readOnlyHint: true }),
+      annotated(
+        "mcpx",
+        "management_list_servers",
+        { readOnlyHint: true },
+        "internal",
+      ),
+    ];
+  }
+
+  const READ_ONLY_PROBE = `
+    const codes = {};
+    for (const name of [
+      "${ALLOWED_NAME}", "${WRITE_NAME}", "docs__delete_page", "wiki__read",
+      "mcpx__management_list_servers", "${DENIED_NAME}", "mcpx_execute",
+    ]) {
+      try { await mcpx.callTool(name, { id: "1" }); codes[name] = "ran"; } catch (error) { codes[name] = error.code; }
+    }
+    return codes;
+  `;
+
+  async function executeReadOnly(client: Client, code: string) {
+    const result = await client.callTool({
+      name: "mcpx_execute_readonly",
+      arguments: { code },
+    });
+    return {
+      isError: result.isError === true,
+      output: JSON.parse(resultText(result)) as {
+        ok: boolean;
+        readOnly?: boolean;
+        result?: unknown;
+        calls: Record<string, unknown>[];
+      },
+    };
+  }
+
+  it.each([
+    ["/mcp", false],
+    ["/mcp/lazy", false],
+    ["/mcp", true],
+    ["/mcp/lazy", true],
+  ] as const)(
+    "mcpx_execute_readonly on %s (per-call approval %s) runs trusted reads only, without prompts",
+    async (endpoint, requireToolApproval) => {
+      const harness = await makeHarness({
+        entries: readOnlyEntries(),
+        codeMode: codeMode(requireToolApproval),
+      });
+      const seen: ElicitRequest[] = [];
+      try {
+        const { client } = await harness.connectClient(endpoint, undefined, {
+          elicit: approveOnce(
+            [{ action: "accept", content: { approve: true } }],
+            seen,
+          ),
+        });
+        const { output, isError } = await executeReadOnly(
+          client,
+          READ_ONLY_PROBE,
+        );
+        expect(isError).toBe(false);
+        expect(output.readOnly).toBe(true);
+        expect(output.result).toEqual({
+          [ALLOWED_NAME]: "ran",
+          [WRITE_NAME]: "read_only_blocked",
+          docs__delete_page: "read_only_blocked",
+          wiki__read: "read_only_blocked",
+          mcpx__management_list_servers: "ran",
+          [DENIED_NAME]: "permission_denied",
+          mcpx_execute: "recursion_blocked",
+        });
+        expect(seen).toEqual([]);
+        expect(harness.upstreamCallTool).toHaveBeenCalledTimes(1);
+        expect(harness.upstreamCallTool).toHaveBeenCalledWith("docs", {
+          name: "get_page",
+          arguments: { id: "1" },
+          _meta: { authorization: "Bearer test-token" },
+        });
+        expect(
+          harness.services.internalCapabilities.dispatchTool,
+        ).toHaveBeenCalledTimes(1);
+        expect(output.calls).toEqual([
+          expect.objectContaining({
+            tool: ALLOWED_NAME,
+            status: "succeeded",
+            approval: "trusted_read",
+          }),
+          expect.objectContaining({
+            tool: WRITE_NAME,
+            status: "rejected",
+            errorCode: "read_only_blocked",
+          }),
+          expect.objectContaining({
+            tool: "docs__delete_page",
+            errorCode: "read_only_blocked",
+          }),
+          expect.objectContaining({
+            tool: "wiki__read",
+            errorCode: "read_only_blocked",
+          }),
+          expect.objectContaining({
+            tool: "mcpx__management_list_servers",
+            status: "succeeded",
+          }),
+          expect.objectContaining({
+            tool: DENIED_NAME,
+            errorCode: "permission_denied",
+          }),
+        ]);
+        expect(harness.auditLog).toHaveBeenCalledWith({
+          eventType: "tool_used",
+          payload: expect.objectContaining({
+            toolName: "get_page",
+            consumerTag: "test-consumer",
+          }),
+        });
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+
+  it.each([false, true])(
+    "keeps mcpx_execute's own policy beside the read-only tool (per-call approval %s)",
+    async (requireToolApproval) => {
+      const harness = await makeHarness({
+        entries: readOnlyEntries(),
+        codeMode: codeMode(requireToolApproval),
+      });
+      const seen: ElicitRequest[] = [];
+      try {
+        const { client } = await harness.connectClient("/mcp/lazy", undefined, {
+          elicit: approveOnce(
+            [{ action: "accept", content: { approve: true } }],
+            seen,
+          ),
+        });
+        const write = `try { await mcpx.callTool("${WRITE_NAME}", { title: "x" }); return "ran"; } catch (error) { return error.code; }`;
+        expect((await executeReadOnly(client, write)).output.result).toBe(
+          "read_only_blocked",
+        );
+        expect(seen).toHaveLength(0);
+        expect((await execute(client, write)).result).toBe("ran");
+        expect(seen).toHaveLength(requireToolApproval ? 1 : 0);
+        expect(harness.upstreamCallTool).toHaveBeenCalledTimes(1);
+        expect(harness.upstreamCallTool).toHaveBeenCalledWith(
+          "tracker",
+          expect.objectContaining({ name: "create_issue" }),
+        );
+        // neither tool reaches the other through a script or a wrapper
+        expect(
+          await execute(
+            client,
+            `try { await mcpx.callTool("mcpx_execute_readonly", { code: "return 1" }); } catch (error) { return error.code; }`,
+          ),
+        ).toMatchObject({ result: "recursion_blocked" });
+        const wrapped = await client.callTool({
+          name: "mcpx_call_tool",
+          arguments: {
+            name: "mcpx_execute_readonly",
+            arguments: { code: "return 1" },
+          },
+        });
+        expect(wrapped.isError).toBe(true);
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+
+  it("does not let a wildcard admit a new annotation-less tool in read-only mode", async () => {
+    const harness = await makeHarness({
+      entries: readOnlyEntries(),
+      codeMode: codeMode(true),
+    });
+    const seen: ElicitRequest[] = [];
+    try {
+      const { client } = await harness.connectClient("/mcp", undefined, {
+        elicit: approveOnce([], seen),
+      });
+      // added after the session started; only the docs__* pattern matches it
+      harness.entries.push(makeEntry("docs", "purge", "docs__purge"));
+      const call = `try { await mcpx.callTool("docs__purge", { id: "1" }); return "ran"; } catch (error) { return error.code; }`;
+      const readOnly = await executeReadOnly(client, call);
+      expect(readOnly.output.result).toBe("read_only_blocked");
+      expect(harness.upstreamCallTool).not.toHaveBeenCalled();
+      // per-call approval keeps treating the pattern as trusted, as before
+      const ordinary = await execute(client, call);
+      expect(ordinary.result).toBe("ran");
+      expect(ordinary.calls).toEqual([
+        expect.objectContaining({ approval: "trusted_read" }),
+      ]);
+      expect(seen).toEqual([]);
+      expect(harness.upstreamCallTool).toHaveBeenCalledTimes(1);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it("re-checks identity and read-only trust on every inner call of the read-only tool", async () => {
+    let calls = 0;
+    const harness: Awaited<ReturnType<typeof makeHarness>> = await makeHarness({
+      entries: readOnlyEntries(),
+      codeMode: codeMode(false),
+      onCallTool: async () => {
+        calls += 1;
+        if (calls === 1) {
+          // the trusted read now declares a write
+          const docs = harness.entries.find(
+            (entry) => entry.definition.name === ALLOWED_NAME,
+          );
+          if (docs)
+            docs.definition = {
+              ...docs.definition,
+              annotations: { readOnlyHint: false },
+            };
+        } else {
+          for (const session of harness.sessions.values()) {
+            session.metadata = {
+              ...session.metadata,
+              authorization: "Bearer other",
+            };
+          }
+        }
+        return { content: [{ type: "text", text: "{}" }] };
+      },
+    });
+    try {
+      harness.entries.push(makeEntry("newsrv", "lookup", "newsrv__lookup"));
+      const { client } = await harness.connectClient("/mcp");
+      const { output } = await executeReadOnly(
+        client,
+        `
+          const codes = [];
+          for (const name of ["${ALLOWED_NAME}", "${ALLOWED_NAME}", "newsrv__lookup", "newsrv__lookup"]) {
+            try { await mcpx.callTool(name, { id: "1" }); codes.push("ran"); } catch (error) { codes.push(error.code); }
+          }
+          return codes;
+        `,
+      );
+      expect(output.result).toEqual([
+        "ran",
+        "read_only_blocked",
+        "ran",
+        "identity_changed",
+      ]);
+      expect(harness.upstreamCallTool).toHaveBeenCalledTimes(2);
+    } finally {
+      await harness.close();
+    }
+  });
 
   it("reaches tools registered after the session started", async () => {
     const harness = await makeHarness({

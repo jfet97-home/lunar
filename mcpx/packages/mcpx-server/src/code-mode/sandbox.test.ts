@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   buildRunnerExecArgv,
+  formatSandboxLog,
   runSandbox,
   SandboxLimits,
   SandboxLog,
   SandboxOutcome,
+  SandboxReply,
   SandboxRequest,
 } from "./sandbox.js";
 
@@ -34,7 +36,7 @@ async function run(
     onRequest?: (
       request: SandboxRequest,
       stopped: AbortSignal,
-    ) => Promise<string>;
+    ) => Promise<SandboxReply>;
   } = {},
 ): Promise<{ outcome: SandboxOutcome; logs: SandboxLog[] }> {
   const logs: SandboxLog[] = [];
@@ -187,6 +189,24 @@ describe("Code Mode sandbox runner", () => {
     expect(total).toBeLessThanOrEqual(LIMITS.maxLogBytes);
   });
 
+  it.each([
+    ["log", 4],
+    ["warn", 11],
+  ])(
+    "truncates console.%s output at a complete UTF-8 character",
+    async (level, maxLogBytes) => {
+      const { outcome, logs } = await run(
+        `console.${level}("aé🙂"); return 1;`,
+        { limits: { maxLogBytes } },
+      );
+      expect(outcome.status).toBe("completed");
+      expect(logs).toEqual([{ level, text: "aé" }]);
+      expect(
+        Buffer.byteLength(logs.map(formatSandboxLog).join("")),
+      ).toBeLessThanOrEqual(maxLogBytes);
+    },
+  );
+
   it("does not send empty console messages through the broker", async () => {
     const { outcome, logs } = await run(`
       for (let i = 0; i < 1000; i++) console.log();
@@ -231,6 +251,35 @@ describe("Code Mode sandbox runner", () => {
     expect(stoppedSignals[0]?.aborted).toBe(true);
   });
 
+  it("reports a reply as sent only when it reached the runner", async () => {
+    const sent: string[] = [];
+    const { outcome } = await run(
+      `
+        await mcpx.callTool("t__awaited", {});
+        mcpx.callTool("t__late", {});
+        return "done";
+      `,
+      {
+        onRequest: async (request) => {
+          const { name } = JSON.parse(request.payload) as { name: string };
+          // the late reply is ready only after the script returned
+          if (name === "t__late") {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+          }
+          return {
+            payload: JSON.stringify({ ok: true, value: {} }),
+            onSent: (): void => {
+              sent.push(name);
+            },
+          };
+        },
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(outcome).toEqual({ status: "completed", result: '"done"' });
+    expect(sent).toEqual(["t__awaited"]);
+  });
+
   it("stops on cancellation and never answers the script afterwards", async () => {
     const controller = new AbortController();
     const requests: string[] = [];
@@ -251,15 +300,308 @@ describe("Code Mode sandbox runner", () => {
   });
 });
 
+describe("mcpx.describe", () => {
+  jest.setTimeout(30_000);
+
+  async function describeIn(code: string): Promise<unknown> {
+    const requests: SandboxRequest[] = [];
+    const { outcome } = await run(code, {
+      onRequest: async (request) => {
+        requests.push(request);
+        return JSON.stringify({ ok: true, value: {} });
+      },
+    });
+    if (outcome.status !== "completed") {
+      throw new Error(`Script did not complete: ${JSON.stringify(outcome)}`);
+    }
+    // describe is pure guest code and never asks the gateway for anything
+    expect(requests).toEqual([]);
+    return JSON.parse(outcome.result);
+  }
+
+  it("describes mixed values by type, keys and sampled array shapes", async () => {
+    const shape = await describeIn(`
+      return mcpx.describe({
+        id: 7, name: "x", ok: true, none: null, missing: undefined,
+        big: 12n, fn: () => 1, sym: Symbol("s"),
+        tags: ["a", "b", "c", "d"],
+        items: [{ id: 1, title: "t" }, { id: 2 }, { id: 3, title: "u" }, { id: 4 }],
+        nested: { deep: { list: [] } },
+      });
+    `);
+    expect(shape).toEqual({
+      type: "object",
+      keys: {
+        id: "number",
+        name: "string",
+        ok: "boolean",
+        none: "null",
+        missing: "undefined",
+        big: "bigint",
+        fn: "function",
+        sym: "symbol",
+        tags: { type: "array", length: 4, items: ["string"], sampled: 3 },
+        items: {
+          type: "array",
+          length: 4,
+          items: [
+            { type: "object", keys: { id: "number", title: "string" } },
+            { type: "object", keys: { id: "number" } },
+          ],
+          sampled: 3,
+        },
+        nested: {
+          type: "object",
+          keys: {
+            deep: {
+              type: "object",
+              keys: { list: { type: "array", length: 0, items: [] } },
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it("handles empty, primitive, cyclic and odd values predictably", async () => {
+    const shapes = await describeIn(`
+      const cyclic = { name: "a" };
+      cyclic.self = cyclic;
+      cyclic.list = [cyclic];
+      const shared = { x: 1 };
+      let getterRan = false;
+      const revocable = Proxy.revocable({}, {});
+      revocable.revoke();
+      const keyless = new Proxy({}, { ownKeys: () => { throw new Error("trap"); } });
+      // Object.keys reads each descriptor once; the second read of "b" throws
+      let reads = 0;
+      const trap = new Proxy({ a: 1, b: 2 }, {
+        getOwnPropertyDescriptor: (target, key) => {
+          if (key === "b" && ++reads > 1) throw new Error("trap");
+          return Reflect.getOwnPropertyDescriptor(target, key);
+        },
+      });
+      const sparse = [];
+      sparse.length = 5000000;
+      const shapes = {
+        null: mcpx.describe(null),
+        undefined: mcpx.describe(undefined),
+        none: mcpx.describe(),
+        string: mcpx.describe("secret"),
+        emptyArray: mcpx.describe([]),
+        emptyObject: mcpx.describe({}),
+        cyclic: mcpx.describe(cyclic),
+        shared: mcpx.describe({ a: shared, b: shared }),
+        getter: mcpx.describe({ get secret() { getterRan = true; return "s"; } }),
+        classes: mcpx.describe({ when: new Date(0), map: new Map([[1, 2]]), bare: Object.create(null) }),
+        // as text: a __proto__ key would become a prototype in an object literal
+        proto: JSON.stringify(mcpx.describe(JSON.parse('{"__proto__": {"a": 1}}'))),
+        revoked: mcpx.describe(revocable.proxy),
+        keyless: mcpx.describe(keyless),
+        trap: mcpx.describe(trap),
+        sparse: mcpx.describe(sparse),
+      };
+      return { shapes, getterRan };
+    `);
+    expect(shapes).toEqual({
+      getterRan: false,
+      shapes: {
+        null: "null",
+        undefined: "undefined",
+        none: "undefined",
+        string: "string",
+        emptyArray: { type: "array", length: 0, items: [] },
+        emptyObject: { type: "object", keys: {} },
+        cyclic: {
+          type: "object",
+          keys: {
+            name: "string",
+            self: "circular",
+            list: { type: "array", length: 1, items: ["circular"] },
+          },
+        },
+        shared: {
+          type: "object",
+          keys: {
+            a: { type: "object", keys: { x: "number" } },
+            b: { type: "object", keys: { x: "number" } },
+          },
+        },
+        getter: { type: "object", keys: { secret: "accessor" } },
+        // only own keys count; no class name is read from the value
+        classes: {
+          type: "object",
+          keys: {
+            when: { type: "object", keys: {} },
+            map: { type: "object", keys: {} },
+            bare: { type: "object", keys: {} },
+          },
+        },
+        proto: JSON.stringify({
+          type: "object",
+          keys: JSON.parse(
+            '{"__proto__": {"type": "object", "keys": {"a": "number"}}}',
+          ),
+        }),
+        revoked: "unreadable",
+        keyless: "unreadable",
+        trap: { type: "object", keys: { a: "number", b: "unreadable" } },
+        sparse: {
+          type: "array",
+          length: 5_000_000,
+          items: ["undefined"],
+          sampled: 3,
+        },
+      },
+    });
+  });
+
+  it("runs no getter or get trap to classify a value, even a tag or array length", async () => {
+    const result = await describeIn(`
+      let tagReads = 0;
+      let lengthReads = 0;
+      const tagged = {
+        id: 1,
+        get [Symbol.toStringTag]() { tagReads++; return "private-fixture-value"; },
+      };
+      const list = new Proxy([1, 2, 3], {
+        get: (target, key, receiver) => {
+          if (key === "length") { lengthReads++; return "private-fixture-value"; }
+          return Reflect.get(target, key, receiver);
+        },
+      });
+      return {
+        shapes: [mcpx.describe(tagged), mcpx.describe(list)],
+        tagReads,
+        lengthReads,
+      };
+    `);
+    expect(result).toEqual({
+      shapes: [
+        { type: "object", keys: { id: "number" } },
+        { type: "array", length: 3, items: ["number"] },
+      ],
+      tagReads: 0,
+      lengthReads: 0,
+    });
+    expect(JSON.stringify(result)).not.toContain("private-fixture-value");
+  });
+
+  it("never returns values, even sensitive-looking ones", async () => {
+    const shape = await describeIn(`
+      return mcpx.describe({
+        password: "hunter2-value",
+        token: "sk-live-value",
+        nested: [{ apiKey: "AKIA-value", count: 42 }],
+        content: [{ type: "text", text: "Bearer abc-value" }],
+      });
+    `);
+    const text = JSON.stringify(shape);
+    for (const value of [
+      "hunter2",
+      "sk-live",
+      "AKIA",
+      "Bearer",
+      "42",
+      ':"text"',
+    ]) {
+      expect(text).not.toContain(value);
+    }
+    expect(shape).toMatchObject({
+      keys: {
+        password: "string",
+        nested: { items: [{ keys: { apiKey: "string", count: "number" } }] },
+        content: { items: [{ keys: { type: "string", text: "string" } }] },
+      },
+    });
+  });
+
+  it("bounds keys, key names, depth and total work", async () => {
+    const result = (await describeIn(`
+      const wide = {};
+      for (let i = 0; i < 100; i++) wide["k" + i] = i;
+      const long = {};
+      long["a".repeat(200)] = 1;
+      long["a".repeat(64) + "b"] = 2;
+      // colliding cut names use the key budget, so "z" is past it
+      const colliding = {};
+      for (let i = 0; i < 30; i++) colliding["b".repeat(64) + i] = i;
+      colliding.z = 1;
+      let deep = "leaf";
+      for (let i = 0; i < 20; i++) deep = { next: deep };
+      const huge = {};
+      for (let i = 0; i < 50; i++) {
+        huge["k" + i] = Array.from({ length: 1000 }, () => wide);
+      }
+      const many = Array.from({ length: 50000 }, (_, id) => ({ id }));
+      const hugeShape = mcpx.describe(huge);
+      return {
+        wide: mcpx.describe(wide),
+        long: mcpx.describe(long),
+        colliding: mcpx.describe(colliding),
+        deep: mcpx.describe(deep),
+        many: mcpx.describe(many),
+        hugeShape,
+        hugeBytes: JSON.stringify(hugeShape).length,
+      };
+    `)) as Record<string, unknown>;
+    const wide = result["wide"] as { keys: object; moreKeys: number };
+    expect(Object.keys(wide.keys)).toHaveLength(24);
+    expect(wide.moreKeys).toBe(76);
+    expect(result["long"]).toEqual({
+      type: "object",
+      keys: { [`${"a".repeat(64)}...`]: "number" },
+      moreKeys: 1,
+    });
+    expect(result["colliding"]).toEqual({
+      type: "object",
+      keys: { [`${"b".repeat(64)}...`]: "number" },
+      moreKeys: 30,
+    });
+    let level = result["deep"] as { keys?: { next: unknown } };
+    for (let depth = 0; depth < 6; depth++) {
+      expect(level).toMatchObject({ type: "object" });
+      level = level.keys?.next as typeof level;
+    }
+    expect(level).toEqual({ type: "object", depthLimited: true });
+    expect(result["many"]).toEqual({
+      type: "array",
+      length: 50_000,
+      items: [{ type: "object", keys: { id: "number" } }],
+      sampled: 3,
+    });
+    // the node budget stops the walk long before the 50 x 1000 x 100 input
+    const countNodes = (shape: unknown): number => {
+      if (typeof shape === "string") return 1;
+      const node = shape as { keys?: object; items?: unknown[] };
+      return (
+        1 +
+        Object.values(node.keys ?? {}).reduce(
+          (sum: number, child) => sum + countNodes(child),
+          0,
+        ) +
+        (node.items ?? []).reduce(
+          (sum: number, child) => sum + countNodes(child),
+          0,
+        )
+      );
+    };
+    expect(countNodes(result["hugeShape"])).toBeLessThanOrEqual(200);
+    expect(result["hugeBytes"]).toBeLessThan(20_000);
+    expect(result["hugeShape"]).toMatchObject({ type: "object", moreKeys: 47 });
+  });
+});
+
 describe("Code Mode runner process permissions", () => {
-  // the permission model compares real paths, and macOS links /var to /private/var
-  const probeDirectory = realpathSync(
-    mkdtempSync(path.join(tmpdir(), "mcpx-code-mode-")),
-  );
-  const probePath = path.join(probeDirectory, "probe.mjs");
-  const secretPath = path.join(probeDirectory, "..", "mcpx-code-mode-secret");
+  let probeDirectory: string | undefined;
+  let probePath: string;
 
   beforeAll(() => {
+    // the permission model compares real paths, and macOS links /var to /private/var
+    probeDirectory = mkdtempSync(path.join(tmpdir(), "mcpx-code-mode-"));
+    probeDirectory = realpathSync(probeDirectory);
+    probePath = path.join(probeDirectory, "probe.mjs");
+    const secretPath = path.join(probeDirectory, "forbidden-write");
     writeFileSync(
       probePath,
       `
@@ -284,7 +626,9 @@ process.send({
   });
 
   afterAll(() => {
-    rmSync(probeDirectory, { recursive: true, force: true });
+    if (probeDirectory) {
+      rmSync(probeDirectory, { recursive: true, force: true });
+    }
   });
 
   it("launches with the permission model, no writes and an empty environment", () => {

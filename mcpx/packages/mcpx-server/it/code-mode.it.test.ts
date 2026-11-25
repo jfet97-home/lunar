@@ -296,6 +296,7 @@ describe("Code Mode through the full gateway", () => {
         "notes__list_notes",
         "notes__create_note",
         "mcpx_execute",
+        "mcpx_execute_readonly",
       ]),
     );
     expect(catalogNames).not.toContain("notes__secret_note");
@@ -304,10 +305,11 @@ describe("Code Mode through the full gateway", () => {
         "mcpx_search_tools",
         "mcpx_call_tool",
         "mcpx_execute",
+        "mcpx_execute_readonly",
       ]),
     );
-    expect(catalog.getInstructions()).toContain("mcpx_execute");
-    expect(lazy.getInstructions()).toContain("mcpx_execute");
+    expect(catalog.getInstructions()).toContain("mcpx_execute_readonly");
+    expect(lazy.getInstructions()).toContain("mcpx_execute_readonly");
     const direct = await catalog.callTool({
       name: "notes__get_note",
       arguments: { id: "n1" },
@@ -400,6 +402,93 @@ describe("Code Mode through the full gateway", () => {
     expect(unsupported.result).toBe("approval_unsupported");
     expect(notes.writes).toEqual(["kept"]);
   });
+
+  it.each(["/mcp", "/mcp/lazy"] as const)(
+    "runs only trusted reads in mcpx_execute_readonly on %s, without prompts, and measures bytes",
+    async (endpoint) => {
+      const asked: ElicitRequest[] = [];
+      const client = await connect(endpoint, {
+        elicit: async (request) => {
+          asked.push(request);
+          return { action: "accept", content: { approve: true } };
+        },
+      });
+      const id = "é世🙂";
+      const result = await client.callTool({
+        name: "mcpx_execute_readonly",
+        arguments: {
+          code: `
+            const codes = {};
+            for (const [name, args] of [
+              ["notes__get_note", { id: ${JSON.stringify(id)} }],
+              ["notes__create_note", { title: "never" }],
+              ["notes__peek", {}],
+              ["notes__secret_note", {}],
+              ["mcpx_execute", { code: "return 1" }],
+            ]) {
+              try { await mcpx.callTool(name, args); codes[name] = "ran"; } catch (error) { codes[name] = error.code; }
+            }
+            const schema = await mcpx.getToolSchema("notes__get_note");
+            return { codes, schema: mcpx.describe(schema.inputSchema.properties) };
+          `,
+        },
+      });
+      const block = (result.content as { type: string; text: string }[])[0];
+      const text = block?.text ?? "{}";
+      const output = JSON.parse(text) as Output & {
+        readOnly: boolean;
+        bytes: Record<string, unknown>;
+      };
+      expect(result.isError).toBeFalsy();
+      expect(output.readOnly).toBe(true);
+      expect(output.result).toEqual({
+        codes: {
+          notes__get_note: "ran",
+          notes__create_note: "read_only_blocked",
+          // readOnlyHint true, but the operator does not trust this server's hints
+          notes__peek: "read_only_blocked",
+          notes__secret_note: "permission_denied",
+          mcpx_execute: "recursion_blocked",
+        },
+        schema: {
+          type: "object",
+          keys: { id: { type: "object", keys: { type: "string" } } },
+        },
+      });
+      expect(asked).toEqual([]);
+      expect(notes.calls).toEqual([{ tool: "get_note", args: { id } }]);
+      expect(notes.writes).toEqual([]);
+
+      const noteBytes = Buffer.byteLength(
+        JSON.stringify({
+          isError: false,
+          content: [
+            { type: "text", text: JSON.stringify({ id, body: `${id} body` }) },
+          ],
+        }),
+      );
+      expect(output.calls[0]).toMatchObject({
+        tool: "notes__get_note",
+        status: "succeeded",
+        approval: "trusted_read",
+        resultBytes: noteBytes,
+      });
+      expect(output.calls.slice(1)).toEqual([
+        expect.objectContaining({ errorCode: "read_only_blocked" }),
+        expect.objectContaining({ errorCode: "read_only_blocked" }),
+        expect.objectContaining({ errorCode: "permission_denied" }),
+      ]);
+      expect(output.bytes).toEqual({
+        toolResults: { received: noteBytes, sent: noteBytes },
+        discovery: {
+          received: expect.any(Number),
+          sent: expect.any(Number),
+        },
+        result: Buffer.byteLength(JSON.stringify(output.result)),
+        logs: 0,
+      });
+    },
+  );
 
   it("enforces each caller's permissions and visibility on every inner call", async () => {
     const agents = await connect("/mcp/lazy");

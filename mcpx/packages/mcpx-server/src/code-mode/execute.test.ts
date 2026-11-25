@@ -29,6 +29,13 @@ interface Execution {
     logs?: string[];
     note?: string;
     callsOverLimit?: number;
+    readOnly?: boolean;
+    bytes: {
+      toolResults: { received: number; sent: number };
+      discovery: { received: number; sent: number };
+      result?: number;
+      logs: number;
+    };
   };
   isError: boolean;
 }
@@ -85,6 +92,8 @@ async function execute(props: {
   approve?: ApprovalRequester;
   limits?: Partial<CodeModeLimits>;
   trustedReadTools?: string[];
+  trustedAnnotationServers?: string[];
+  readOnly?: boolean;
   signal?: AbortSignal;
 }): Promise<Execution> {
   const result = await executeCode({
@@ -98,8 +107,9 @@ async function execute(props: {
     },
     trust: {
       trustedReadTools: props.trustedReadTools ?? [],
-      trustedAnnotationServers: [],
+      trustedAnnotationServers: props.trustedAnnotationServers ?? [],
     },
+    readOnly: props.readOnly,
     gateway: props.gateway,
     approve: props.approve ?? approveAll,
     signal: props.signal,
@@ -553,5 +563,364 @@ describe("Code Mode execution", () => {
       expect.objectContaining({ status: "not_started" }),
     ]);
     expect(gateway.dispatched).toEqual([]);
+  });
+});
+
+describe("Code Mode byte accounting", () => {
+  jest.setTimeout(30_000);
+  const bytesOf = (value: unknown): number =>
+    Buffer.byteLength(JSON.stringify(value));
+
+  it("measures UTF-8 bytes per stage without double-counting derived fields", async () => {
+    const multibyte = "héllo 世界 🙂";
+    const content = [
+      { type: "text" as const, text: JSON.stringify({ note: multibyte }) },
+    ];
+    const structured = { note: multibyte };
+    const gateway = makeGateway({
+      docs__text: { run: async () => ({ content }) },
+      docs__both: {
+        run: async () => ({ content, structuredContent: structured }),
+      },
+      docs__broken: {
+        run: async () => ({
+          content: [{ type: "text", text: "no" }],
+          isError: true,
+        }),
+      },
+    });
+    const { output } = await execute({
+      gateway,
+      trustedReadTools: ["docs__*"],
+      code: `
+        const text = await mcpx.callTool("docs__text", {});
+        const both = await mcpx.callTool("docs__both", {});
+        const broken = await mcpx.callTool("docs__broken", {});
+        await mcpx.searchTools("docs");
+        console.log("ü");
+        console.warn("x");
+        return text.data.note.length + both.data.note.length + (broken.isError ? 1 : 0) === 23 ? "é" : "?";
+      `,
+    });
+    expect(output.result).toBe("é");
+    const textBytes = bytesOf({ isError: false, content });
+    const bothBytes = bytesOf({
+      isError: false,
+      content,
+      structuredContent: structured,
+    });
+    const brokenBytes = bytesOf({
+      isError: true,
+      content: [{ type: "text", text: "no" }],
+    });
+    // multibyte text is counted in bytes, not characters
+    expect(textBytes).toBeGreaterThan(
+      JSON.stringify({ isError: false, content }).length,
+    );
+    expect(output.calls.map((call) => call["resultBytes"])).toEqual([
+      textBytes,
+      bothBytes,
+      brokenBytes,
+    ]);
+    const searchBytes = Buffer.byteLength(
+      JSON.stringify({
+        tool: "mcpx_search_tools",
+        args: { query: "docs" },
+        tools: ["docs__text", "docs__both", "docs__broken"],
+      }),
+    );
+    expect(output.bytes).toEqual({
+      toolResults: {
+        received: textBytes + bothBytes + brokenBytes,
+        sent: textBytes + bothBytes + brokenBytes,
+      },
+      discovery: { received: searchBytes, sent: searchBytes },
+      result: Buffer.byteLength('"é"'),
+      logs: Buffer.byteLength("ü") + Buffer.byteLength("[warn] x"),
+    });
+  });
+
+  it("counts withheld replies as received only and claims no size for data never received", async () => {
+    const controller = new AbortController();
+    const big = "x".repeat(5_000);
+    const gateway = makeGateway(
+      {
+        docs__dump: { run: async () => textResult(big) },
+        docs__lost: {
+          run: async () => {
+            throw new Error("Connection closed");
+          },
+        },
+        docs__denied: { reject: "permission_denied" },
+        docs__hang: {
+          run: () => {
+            setTimeout(() => controller.abort(), 50);
+            return new Promise<CallToolResult>(() => {});
+          },
+        },
+      },
+      {
+        discover: async (tool) =>
+          tool === "mcpx_get_tool_schema"
+            ? textResult(JSON.stringify({ name: "huge", schema: big }))
+            : { content: [{ type: "text", text: "bad query" }], isError: true },
+      },
+    );
+    const { output } = await execute({
+      gateway,
+      signal: controller.signal,
+      trustedReadTools: ["docs__*"],
+      limits: { maxToolResultBytes: 1_000 },
+      code: `
+        for (const run of [
+          () => mcpx.callTool("docs__dump", {}),
+          () => mcpx.callTool("docs__lost", {}),
+          () => mcpx.callTool("docs__denied", {}),
+          () => mcpx.getToolSchema("huge"),
+          () => mcpx.searchTools("bad"),
+        ]) {
+          try { await run(); } catch (error) { console.log(error.code); }
+        }
+        await mcpx.callTool("docs__hang", {});
+      `,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const dumpBytes = bytesOf({
+      isError: false,
+      content: [{ type: "text", text: big }],
+    });
+    const schemaBytes = bytesOf({ name: "huge", schema: big });
+    expect(output.error?.code).toBe("cancelled");
+    expect(output.logs).toEqual([
+      "result_too_large",
+      "call_failed",
+      "permission_denied",
+      "result_too_large",
+      "invalid_request",
+    ]);
+    expect(output.calls).toEqual([
+      expect.objectContaining({
+        tool: "docs__dump",
+        status: "succeeded",
+        resultWithheld: true,
+        resultBytes: dumpBytes,
+      }),
+      expect.not.objectContaining({ resultBytes: expect.anything() }),
+      expect.not.objectContaining({ resultBytes: expect.anything() }),
+      expect.not.objectContaining({ resultBytes: expect.anything() }),
+    ]);
+    expect(output.calls[3]).toMatchObject({ status: "in_flight" });
+    expect(output.bytes).toEqual({
+      toolResults: { received: dumpBytes, sent: 0 },
+      discovery: { received: schemaBytes, sent: 0 },
+      logs: expect.any(Number),
+    });
+    expect(output.bytes).not.toHaveProperty("result");
+  });
+});
+
+describe("Code Mode read-only execution", () => {
+  jest.setTimeout(30_000);
+
+  it("runs trusted reads and refuses untrusted, unknown and write tools before dispatch", async () => {
+    const gateway = makeGateway({
+      docs__get: { run: async () => textResult('{"title":"ok"}') },
+      docs__delete: { annotations: { readOnlyHint: false } },
+      // a tool added later that only the docs__* pattern matches
+      docs__purge: {},
+      wiki__read: { annotations: { readOnlyHint: true } },
+      kb__read: { annotations: { readOnlyHint: true } },
+      tracker__create: {},
+      mcpx__management_list_servers: {
+        origin: "internal",
+        annotations: { readOnlyHint: true },
+      },
+      mcpx__management_remove_server: {
+        origin: "internal",
+        annotations: { readOnlyHint: false, destructiveHint: true },
+      },
+    });
+    const approve = jest.fn(approveAll);
+    const { output, isError } = await execute({
+      gateway,
+      approve,
+      readOnly: true,
+      trustedReadTools: ["docs__get", "docs__delete", "docs__*", "mcpx__*"],
+      trustedAnnotationServers: ["kb", "wiki*"],
+      code: `
+        const codes = {};
+        for (const name of [
+          "docs__get", "docs__delete", "docs__purge", "wiki__read", "kb__read", "tracker__create",
+          "mcpx__management_list_servers", "mcpx__management_remove_server",
+          "missing__tool", "mcpx_execute", "mcpx_execute_readonly", "mcpx_call_tool",
+        ]) {
+          try { await mcpx.callTool(name, {}); codes[name] = "ran"; } catch (error) { codes[name] = error.code; }
+        }
+        return codes;
+      `,
+    });
+    expect(isError).toBe(false);
+    expect(output.readOnly).toBe(true);
+    expect(output.result).toEqual({
+      docs__get: "ran",
+      docs__delete: "read_only_blocked",
+      docs__purge: "read_only_blocked",
+      wiki__read: "read_only_blocked",
+      kb__read: "ran",
+      tracker__create: "read_only_blocked",
+      mcpx__management_list_servers: "ran",
+      mcpx__management_remove_server: "read_only_blocked",
+      missing__tool: "not_available",
+      mcpx_execute: "recursion_blocked",
+      mcpx_execute_readonly: "recursion_blocked",
+      mcpx_call_tool: "recursion_blocked",
+    });
+    expect(approve).not.toHaveBeenCalled();
+    expect(gateway.dispatched.map(([name]) => name)).toEqual([
+      "docs__get",
+      "kb__read",
+      "mcpx__management_list_servers",
+    ]);
+    expect(output.calls).toEqual([
+      expect.objectContaining({
+        tool: "docs__get",
+        status: "succeeded",
+        approval: "trusted_read",
+      }),
+      expect.objectContaining({
+        tool: "docs__delete",
+        status: "rejected",
+        errorCode: "read_only_blocked",
+      }),
+      expect.objectContaining({
+        tool: "docs__purge",
+        status: "rejected",
+        errorCode: "read_only_blocked",
+      }),
+      expect.objectContaining({
+        tool: "wiki__read",
+        status: "rejected",
+        errorCode: "read_only_blocked",
+      }),
+      expect.objectContaining({
+        tool: "kb__read",
+        status: "succeeded",
+        approval: "trusted_read",
+      }),
+      expect.objectContaining({
+        tool: "tracker__create",
+        status: "rejected",
+        errorCode: "read_only_blocked",
+      }),
+      expect.objectContaining({
+        tool: "mcpx__management_list_servers",
+        status: "succeeded",
+      }),
+      expect.objectContaining({
+        tool: "mcpx__management_remove_server",
+        errorCode: "read_only_blocked",
+      }),
+      expect.objectContaining({
+        tool: "missing__tool",
+        status: "rejected",
+        errorCode: "not_available",
+      }),
+    ]);
+  });
+
+  it("keeps discovery and describe available on discovery and call results", async () => {
+    const gateway = makeGateway(
+      {
+        docs__list: {
+          run: async () => ({
+            content: [
+              { type: "text", text: '{"pages":[{"id":"a","secret":"s1"}]}' },
+            ],
+            structuredContent: { pages: [{ id: "a", secret: "s1" }] },
+          }),
+        },
+      },
+      {
+        discover: async () =>
+          textResult(
+            JSON.stringify({
+              name: "docs__list",
+              inputSchema: {
+                type: "object",
+                properties: { q: { type: "string" } },
+              },
+            }),
+          ),
+      },
+    );
+    const { output } = await execute({
+      gateway,
+      readOnly: true,
+      trustedReadTools: ["docs__list"],
+      code: `
+        const schema = await mcpx.getToolSchema("docs__list");
+        const listed = await mcpx.callTool("docs__list", {});
+        return {
+          schema: mcpx.describe(schema.inputSchema.properties),
+          data: mcpx.describe(listed.data),
+          content: mcpx.describe(listed.content),
+        };
+      `,
+    });
+    expect(output.result).toEqual({
+      schema: {
+        type: "object",
+        keys: { q: { type: "object", keys: { type: "string" } } },
+      },
+      data: {
+        type: "object",
+        keys: {
+          pages: {
+            type: "array",
+            length: 1,
+            items: [
+              { type: "object", keys: { id: "string", secret: "string" } },
+            ],
+          },
+        },
+      },
+      content: {
+        type: "array",
+        length: 1,
+        items: [{ type: "object", keys: { type: "string", text: "string" } }],
+      },
+    });
+    expect(JSON.stringify(output.result)).not.toContain("s1");
+  });
+
+  it("re-evaluates read-only trust from the live definition on every call", async () => {
+    let annotations: Tool["annotations"] = { readOnlyHint: true };
+    const gateway = makeGateway({ docs__get: {} });
+    const resolve = gateway.resolve;
+    gateway.resolve = (name) => {
+      const resolved = resolve(name);
+      return resolved.ok
+        ? { ...resolved, definition: { ...resolved.definition, annotations } }
+        : resolved;
+    };
+    gateway.dispatch = async (name, args, binding) => {
+      annotations = { readOnlyHint: false };
+      return binding === "binding:docs__get" && name === "docs__get"
+        ? { kind: "result", result: textResult(JSON.stringify(args)) }
+        : { kind: "rejected", code: "target_changed", message: "x" };
+    };
+    const { output } = await execute({
+      gateway,
+      readOnly: true,
+      trustedReadTools: ["docs__get"],
+      code: `
+        const codes = [];
+        for (let i = 0; i < 2; i++) {
+          try { await mcpx.callTool("docs__get", { i }); codes.push("ran"); } catch (error) { codes.push(error.code); }
+        }
+        return codes;
+      `,
+    });
+    expect(output.result).toEqual(["ran", "read_only_blocked"]);
   });
 });
