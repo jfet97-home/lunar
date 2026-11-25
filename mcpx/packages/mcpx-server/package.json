@@ -33,7 +33,7 @@
   "dependencies": {
     "@aigw/core": "file:../../../ai-gateway-shared/public/packages/core",
     "@huggingface/transformers": "3.8.1",
-    "onnxruntime-web": "1.22.0-dev.20250409-89f8206ba4",
+    "@jitl/quickjs-wasmfile-release-sync": "0.32.0",
     "@mcpx/shared-model": "1.0.0",
     "@mcpx/toolkit-core": "1.0.0",
     "@mcpx/webapp-protocol": "1.0.0",
@@ -48,6 +48,8 @@
     "express": "^5.1.0",
     "js-tiktoken": "^1.0.21",
     "luxon": "^3.7.1",
+    "onnxruntime-web": "1.22.0-dev.20250409-89f8206ba4",
+    "quickjs-emscripten-core": "0.32.0",
     "semver": "^6.3.1",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1",
